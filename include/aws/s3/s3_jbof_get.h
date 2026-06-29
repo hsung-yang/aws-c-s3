@@ -42,6 +42,16 @@ struct aws_s3_jbof_client_options {
     /* Layout cache size (default 1024 if 0). Entries are evicted LRU once
      * the table is full or when their lease expires. */
     size_t                 max_cache_entries;
+
+    /* SigV4 credentials. When access_key / secret_key are non-empty, the
+     * client signs every outbound HTTP request (Authorization +
+     * X-Amz-Date + X-Amz-Content-SHA256). All-empty → unsigned (works
+     * against the permissive mock server). session_token is optional. */
+    struct aws_byte_cursor access_key;
+    struct aws_byte_cursor secret_key;
+    struct aws_byte_cursor session_token;
+    struct aws_byte_cursor region;      /* default "us-east-1" if empty */
+    struct aws_byte_cursor service;     /* default "s3" if empty */
 };
 
 struct aws_s3_jbof_get_options {
@@ -88,6 +98,15 @@ struct aws_s3_jbof_get_options {
      * also clips extents to the requested range. */
     uint64_t                                req_range_offset;
     uint64_t                                req_range_length;
+
+    /* SigV4 credentials for this single call (only consulted by the
+     * standalone aws_s3_jbof_get_object; the cached client carries its
+     * own credentials in aws_s3_jbof_client_options). */
+    struct aws_byte_cursor                  access_key;
+    struct aws_byte_cursor                  secret_key;
+    struct aws_byte_cursor                  session_token;
+    struct aws_byte_cursor                  region;
+    struct aws_byte_cursor                  service;
 };
 
 struct aws_s3_jbof_get_result {

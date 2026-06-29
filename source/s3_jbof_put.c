@@ -19,6 +19,7 @@
 #include <aws/http/http.h>
 #include <aws/io/io.h>
 #include <aws/s3/s3.h>
+#include <aws/s3/s3_jbof_sigv4.h>
 
 #include "object_rdma/read_planner.h"
 #include "object_rdma/write_planner.h"
@@ -115,6 +116,49 @@ static void jbof_put_header_value(const char *hdr, const char *name,
     }
 }
 
+/* Emit signed headers when access_key/secret_key are non-empty.
+ * Writes the header block (terminated with \r\n after each header) into
+ * out. NOTE: Custom headers (X-S3RDMA-*, x-amz-checksum-crc32c) are NOT
+ * included in the canonical signature today — see the C1 commit message
+ * for the rationale. */
+static void jbof_put_emit_sig_block(const struct aws_s3_jbof_put_options *o,
+                                    const char *method, const char *path,
+                                    const char *query, const char *host_port,
+                                    char *out, size_t cap) {
+    out[0] = '\0';
+    if (!o->access_key.len || !o->secret_key.len) return;
+    char ak[256], sk[256], st[1024], rg[64], sv[32];
+    /* Mini reusable copier (same logic as get-side). */
+    #define CUR(c,b) ((c).len ? (memcpy((b), (c).ptr, (c).len < sizeof(b)-1 ? (c).len : sizeof(b)-1), \
+                                 (b)[(c).len < sizeof(b)-1 ? (c).len : sizeof(b)-1] = '\0', (b)) : "")
+    struct aws_s3_jbof_sigv4_input in = {
+        .method = method, .canonical_uri = path, .canonical_query = query,
+        .host_header = host_port,
+        .region  = o->region.len  ? CUR(o->region,  rg) : "us-east-1",
+        .service = o->service.len ? CUR(o->service, sv) : "s3",
+        .access_key = CUR(o->access_key, ak),
+        .secret_key = CUR(o->secret_key, sk),
+        .session_token = o->session_token.len ? CUR(o->session_token, st) : NULL,
+    };
+    #undef CUR
+    struct aws_s3_jbof_sigv4_output svo = {0};
+    if (aws_s3_jbof_sigv4_sign(&in, &svo) != AWS_OP_SUCCESS) return;
+
+    int n = snprintf(out, cap,
+        "X-Amz-Date: %s\r\n"
+        "X-Amz-Content-SHA256: %s\r\n"
+        "Authorization: %s\r\n",
+        svo.amz_date, svo.content_sha256, svo.authorization);
+    if (o->session_token.len) {
+        char st2[1024];
+        size_t nt = o->session_token.len < sizeof(st2) - 1
+                  ? o->session_token.len : sizeof(st2) - 1;
+        memcpy(st2, o->session_token.ptr, nt);
+        st2[nt] = '\0';
+        snprintf(out + n, cap - n, "X-Amz-Security-Token: %s\r\n", st2);
+    }
+}
+
 /* ── target-device → fd resolver (open RDWR for PUT) ───────────────── */
 
 struct jbof_put_target_map {
@@ -208,18 +252,31 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     int sock = jbof_put_tcp_connect(host_z, options->meta_server_port);
     if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
-    char req[1024];
+    char path[512];
+    snprintf(path, sizeof(path), "/%.*s/%.*s",
+             (int)options->bucket.len, options->bucket.ptr,
+             (int)options->key.len, options->key.ptr);
+    char host_port[96];
+    snprintf(host_port, sizeof(host_port), "%s:%u",
+             host_z, (unsigned)options->meta_server_port);
+    char sig_block[1536];
+    jbof_put_emit_sig_block(options, "PUT", path, "", host_port,
+                            sig_block, sizeof(sig_block));
+
+    char req[2048];
     int reqlen = snprintf(req, sizeof(req),
         "PUT /%.*s/%.*s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "Accept: application/vnd.s3rdma.placement+json\r\n"
         "X-S3RDMA-Object-Size: %zu\r\n"
         "Content-Length: 0\r\n"
+        "%s"
         "\r\n",
         (int)options->bucket.len, options->bucket.ptr,
         (int)options->key.len,    options->key.ptr,
         host_z, (unsigned)options->meta_server_port,
-        options->source_length);
+        options->source_length,
+        sig_block);
     if (jbof_put_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
@@ -350,19 +407,25 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     int csock = jbof_put_tcp_connect(host_z, options->meta_server_port);
     if (csock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
-    char creq[1024];
+    char csig[1536];
+    jbof_put_emit_sig_block(options, "PUT", path, "rdma-commit=", host_port,
+                            csig, sizeof(csig));
+
+    char creq[2048];
     int crlen = snprintf(creq, sizeof(creq),
         "PUT /%.*s/%.*s?rdma-commit HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "X-S3RDMA-Write-Token: %s\r\n"
         "x-amz-checksum-crc32c: %u\r\n"
         "Content-Length: 0\r\n"
+        "%s"
         "\r\n",
         (int)options->bucket.len, options->bucket.ptr,
         (int)options->key.len,    options->key.ptr,
         host_z, (unsigned)options->meta_server_port,
         write_token,
-        full_crc);
+        full_crc,
+        csig);
     if (jbof_put_send_all(csock, creq, (size_t)crlen) < 0) {
         close(csock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);

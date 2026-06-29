@@ -41,6 +41,13 @@ struct aws_s3_jbof_put_options {
     size_t                                  target_device_count;
 
     int                                     workers_per_target;
+
+    /* SigV4. All-empty → unsigned. */
+    struct aws_byte_cursor access_key;
+    struct aws_byte_cursor secret_key;
+    struct aws_byte_cursor session_token;
+    struct aws_byte_cursor region;
+    struct aws_byte_cursor service;
 };
 
 struct aws_s3_jbof_put_result {

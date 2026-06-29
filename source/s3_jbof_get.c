@@ -24,6 +24,7 @@
 #include <aws/http/http.h>
 #include <aws/io/io.h>
 #include <aws/s3/s3.h>
+#include <aws/s3/s3_jbof_sigv4.h>
 
 #include "object_rdma/read_planner.h"
 
@@ -102,6 +103,54 @@ static int jbof_recv_body(int fd, char *buf, int content_len) {
 }
 
 /* Find header value (case-insensitive). Returns 0/'\0'-padded buf. */
+/* Copy an aws_byte_cursor into a NUL-terminated buffer. Returns "" if the
+ * cursor is empty. Caller-provided buffer must be at least cap bytes. */
+static const char *jbof_cur_to_cstr(struct aws_byte_cursor c, char *buf, size_t cap) {
+    if (c.len == 0) { if (cap) buf[0] = '\0'; return buf; }
+    size_t n = c.len < cap - 1 ? c.len : cap - 1;
+    memcpy(buf, c.ptr, n);
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Build SigV4 headers for a request. Writes the three header strings to
+ * out (each pre-allocated). Returns AWS_OP_SUCCESS or sets aws_last_error.
+ *
+ * extra_block / extra_names follow the contract in s3_jbof_sigv4.h. */
+struct jbof_sigv4_creds {
+    struct aws_byte_cursor access_key, secret_key, session_token, region, service;
+};
+
+static int jbof_build_sigv4(const struct jbof_sigv4_creds *c,
+                            const char *method,
+                            const char *path,
+                            const char *query,
+                            const char *host_header,
+                            const char *extra_block,
+                            const char *extra_names,
+                            struct aws_s3_jbof_sigv4_output *out) {
+    char ak[256], sk[256], st[1024], rg[64], sv[32];
+    struct aws_s3_jbof_sigv4_input in = {
+        .method                       = method,
+        .canonical_uri                = path,
+        .canonical_query              = query,
+        .host_header                  = host_header,
+        .region                       = c->region.len ? jbof_cur_to_cstr(c->region, rg, sizeof(rg))
+                                                      : "us-east-1",
+        .service                      = c->service.len ? jbof_cur_to_cstr(c->service, sv, sizeof(sv))
+                                                       : "s3",
+        .access_key                   = jbof_cur_to_cstr(c->access_key, ak, sizeof(ak)),
+        .secret_key                   = jbof_cur_to_cstr(c->secret_key, sk, sizeof(sk)),
+        .session_token                = c->session_token.len
+                                          ? jbof_cur_to_cstr(c->session_token, st, sizeof(st))
+                                          : NULL,
+        .extra_signed_headers_block   = extra_block,
+        .extra_signed_headers_names   = extra_names,
+        .timestamp                    = 0,
+    };
+    return aws_s3_jbof_sigv4_sign(&in, out);
+}
+
 static void jbof_header_value(const char *hdr, const char *name,
                               char *out, size_t outsz) {
     out[0] = '\0';
@@ -360,7 +409,7 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     int sock = jbof_tcp_connect(host_z, options->meta_server_port);
     if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
-    char req[1024];
+    char req[2048];
     char range_hdr[64] = "";
     if (options->req_range_length) {
         snprintf(range_hdr, sizeof(range_hdr),
@@ -369,16 +418,49 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
                  (unsigned long long)(options->req_range_offset
                                       + options->req_range_length - 1));
     }
+
+    /* Optional SigV4 signing. */
+    char sig_block[1536] = "";
+    if (options->access_key.len && options->secret_key.len) {
+        char path[512];
+        snprintf(path, sizeof(path), "/%.*s/%.*s",
+                 (int)options->bucket.len, options->bucket.ptr,
+                 (int)options->key.len,    options->key.ptr);
+        char host_port[96];
+        snprintf(host_port, sizeof(host_port), "%s:%u",
+                 host_z, (unsigned)options->meta_server_port);
+        struct aws_s3_jbof_sigv4_output sv = {0};
+        struct jbof_sigv4_creds c = {
+            .access_key = options->access_key, .secret_key = options->secret_key,
+            .session_token = options->session_token,
+            .region = options->region, .service = options->service,
+        };
+        if (jbof_build_sigv4(&c, "GET", path, "", host_port, NULL, NULL, &sv)
+            == AWS_OP_SUCCESS) {
+            int sn = snprintf(sig_block, sizeof(sig_block),
+                "X-Amz-Date: %s\r\n"
+                "X-Amz-Content-SHA256: %s\r\n"
+                "Authorization: %s\r\n",
+                sv.amz_date, sv.content_sha256, sv.authorization);
+            if (options->session_token.len) {
+                char st[1024];
+                jbof_cur_to_cstr(options->session_token, st, sizeof(st));
+                snprintf(sig_block + sn, sizeof(sig_block) - sn,
+                         "X-Amz-Security-Token: %s\r\n", st);
+            }
+        }
+    }
+
     int  reqlen = snprintf(req, sizeof(req),
         "GET /%.*s/%.*s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "Accept: application/vnd.s3rdma.layout+json\r\n"
-        "%s"
+        "%s%s"
         "\r\n",
         (int)options->bucket.len, options->bucket.ptr,
         (int)options->key.len,    options->key.ptr,
         host_z, (unsigned)options->meta_server_port,
-        range_hdr);
+        range_hdr, sig_block);
     if (jbof_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
@@ -707,6 +789,10 @@ struct aws_s3_jbof_client {
     size_t                   cache_count;
     pthread_mutex_t          fd_mu;
     struct jbof_fd_entry    *fd_head;
+    /* SigV4 credentials. All zero-length → unsigned mode. */
+    char access_key[256], secret_key[256], session_token[1024];
+    char region[64], service[32];
+    int  signing_enabled;
 };
 
 struct aws_s3_jbof_client *aws_s3_jbof_client_new(
@@ -727,6 +813,17 @@ struct aws_s3_jbof_client *aws_s3_jbof_client_new(
     c->max_cache_entries = options->max_cache_entries ? options->max_cache_entries : 1024;
     pthread_mutex_init(&c->cache_mu, NULL);
     pthread_mutex_init(&c->fd_mu, NULL);
+
+    if (options->access_key.len && options->secret_key.len) {
+        jbof_cur_to_cstr(options->access_key,    c->access_key,    sizeof(c->access_key));
+        jbof_cur_to_cstr(options->secret_key,    c->secret_key,    sizeof(c->secret_key));
+        jbof_cur_to_cstr(options->session_token, c->session_token, sizeof(c->session_token));
+        jbof_cur_to_cstr(options->region,        c->region,        sizeof(c->region));
+        jbof_cur_to_cstr(options->service,       c->service,       sizeof(c->service));
+        if (!c->region[0])  snprintf(c->region,  sizeof(c->region),  "us-east-1");
+        if (!c->service[0]) snprintf(c->service, sizeof(c->service), "s3");
+        c->signing_enabled = 1;
+    }
     return c;
 }
 
@@ -894,6 +991,7 @@ static int jbof_fetch_layout(struct aws_allocator *allocator,
                              const char *host_z, uint16_t port,
                              struct aws_byte_cursor bucket,
                              struct aws_byte_cursor key,
+                             const struct aws_s3_jbof_client *signing_client,
                              char *lease_token_out, size_t lease_token_cap,
                              struct jbof_cache_entry **out_entry) {
     *out_entry = NULL;
@@ -902,14 +1000,46 @@ static int jbof_fetch_layout(struct aws_allocator *allocator,
     int sock = jbof_tcp_connect(host_z, port);
     if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
-    char req[1024];
+    char sig_block[1536] = "";
+    if (signing_client && signing_client->signing_enabled) {
+        char path[512];
+        snprintf(path, sizeof(path), "/%.*s/%.*s",
+                 (int)bucket.len, bucket.ptr, (int)key.len, key.ptr);
+        char host_port[96];
+        snprintf(host_port, sizeof(host_port), "%s:%u", host_z, (unsigned)port);
+        struct aws_s3_jbof_sigv4_input in = {
+            .method = "GET", .canonical_uri = path, .canonical_query = "",
+            .host_header = host_port,
+            .region = signing_client->region, .service = signing_client->service,
+            .access_key = signing_client->access_key,
+            .secret_key = signing_client->secret_key,
+            .session_token = signing_client->session_token[0]
+                               ? signing_client->session_token : NULL,
+        };
+        struct aws_s3_jbof_sigv4_output sv = {0};
+        if (aws_s3_jbof_sigv4_sign(&in, &sv) == AWS_OP_SUCCESS) {
+            int sn = snprintf(sig_block, sizeof(sig_block),
+                "X-Amz-Date: %s\r\n"
+                "X-Amz-Content-SHA256: %s\r\n"
+                "Authorization: %s\r\n",
+                sv.amz_date, sv.content_sha256, sv.authorization);
+            if (signing_client->session_token[0]) {
+                snprintf(sig_block + sn, sizeof(sig_block) - sn,
+                         "X-Amz-Security-Token: %s\r\n",
+                         signing_client->session_token);
+            }
+        }
+    }
+
+    char req[2048];
     int reqlen = snprintf(req, sizeof(req),
         "GET /%.*s/%.*s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "Accept: application/vnd.s3rdma.layout+json\r\n"
+        "%s"
         "\r\n",
         (int)bucket.len, bucket.ptr, (int)key.len, key.ptr,
-        host_z, (unsigned)port);
+        host_z, (unsigned)port, sig_block);
     if (jbof_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
@@ -1066,6 +1196,7 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
         struct jbof_cache_entry *fresh = NULL;
         if (jbof_fetch_layout(alloc, client->meta_host, client->meta_port,
                               options->bucket, options->key,
+                              client,
                               lease_token, sizeof(lease_token),
                               &fresh) != AWS_OP_SUCCESS) {
             return AWS_OP_ERR;
