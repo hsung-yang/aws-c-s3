@@ -6,6 +6,7 @@ option(ASSERT_LOCK_HELD "Enable ASSERT_SYNCED_DATA_LOCK_HELD for checking thread
 option(ENABLE_MOCK_SERVER_TESTS "Whether to run the integration tests that rely on pre-configured mock server" OFF)
 option(ENABLE_MRAP_TESTS "Whether to run the integration tests that rely on pre-configured multi-region access point" OFF)
 option(AWS_ENABLE_S3_ENDPOINT_RESOLVER "Whether to include the s3 endpoint resolver and related config files" OFF)
+option(AWS_ENABLE_JBOF "Build the JBOF-direct GetObject helper (requires libobject_rdma target)" OFF)
 
 if (ASSERT_LOCK_HELD)
     add_definitions(-DASSERT_LOCK_HELD)
@@ -72,6 +73,16 @@ set_target_properties(${PROJECT_NAME} PROPERTIES SOVERSION 0unstable)
 target_compile_definitions(${PROJECT_NAME} PRIVATE -DCJSON_HIDE_SYMBOLS)
 if (AWS_ENABLE_S3_ENDPOINT_RESOLVER)
     target_compile_definitions(${PROJECT_NAME} PRIVATE "-DAWS_ENABLE_S3_ENDPOINT_RESOLVER")
+endif()
+
+if (AWS_ENABLE_JBOF)
+    if (NOT TARGET object_rdma)
+        message(FATAL_ERROR "AWS_ENABLE_JBOF=ON requires the object_rdma target to be available (add_subdirectory the libobject_rdma project before aws-c-s3).")
+    endif()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AWS_ENABLE_JBOF)
+    # PRIVATE: callers of libaws-c-s3 use the aws_s3_jbof_get_object() API
+    # and don't need to know about the underlying object_rdma symbols.
+    target_link_libraries(${PROJECT_NAME} PRIVATE object_rdma)
 endif()
 
 target_include_directories(${PROJECT_NAME} PUBLIC
