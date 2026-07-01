@@ -21,6 +21,7 @@
 
 #include <aws/common/allocator.h>
 #include <aws/common/error.h>
+#include <aws/http/http.h>
 #include <aws/s3/s3.h>
 
 #include <arpa/inet.h>

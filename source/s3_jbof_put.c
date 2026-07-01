@@ -36,7 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define JBOF_PUT_MAX_EXTENTS    64
+#define JBOF_PUT_MAX_EXTENTS    1024
 #define JBOF_PUT_HDR_BUF        65536
 #define JBOF_PUT_BODY_BUF       131072
 
