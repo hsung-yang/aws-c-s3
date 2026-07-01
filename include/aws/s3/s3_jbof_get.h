@@ -182,6 +182,40 @@ int aws_s3_jbof_client_get_object(
     const struct aws_s3_jbof_get_options *options,
     struct aws_s3_jbof_get_result *out_result);
 
+/* ── Meta-request extra (A5: aws_s3_client_make_meta_request dispatch) ── */
+
+/* Forward declaration; full definition is in s3_jbof_put.h. */
+struct aws_s3_jbof_put_result;
+
+/* Pass a pointer to this struct as aws_s3_meta_request_options.user_data
+ * when using AWS_S3_META_REQUEST_TYPE_JBOF_GET or _JBOF_PUT.
+ * The caller owns all referenced buffers for the lifetime of the meta-request.
+ * On completion, result_out/put_result_out is populated before finish_callback
+ * fires. Include s3_jbof_put.h to access put_result_out fields. */
+struct aws_s3_jbof_meta_request_extra {
+    /* GET destination / PUT source (CUDA-managed or host memory). */
+    void                                   *gpu_buffer;
+    size_t                                  gpu_buffer_capacity;
+
+    const struct aws_s3_jbof_target_device *target_devices;
+    size_t                                  target_device_count;
+    int                                     workers_per_target;
+    int                                     verify_crc;    /* default: 1 */
+    int                                     use_o_direct;
+
+    /* SigV4 credentials (all-empty → unsigned). */
+    struct aws_byte_cursor                  access_key;
+    struct aws_byte_cursor                  secret_key;
+    struct aws_byte_cursor                  session_token;
+    struct aws_byte_cursor                  region;
+    struct aws_byte_cursor                  service;
+
+    /* GET result populated before finish_callback fires. */
+    struct aws_s3_jbof_get_result           result_out;
+    /* PUT result; only populated when type == JBOF_PUT. */
+    struct aws_s3_jbof_put_result          *put_result_ptr; /* caller-alloc */
+};
+
 #ifdef __cplusplus
 }
 #endif

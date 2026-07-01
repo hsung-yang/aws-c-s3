@@ -79,9 +79,9 @@ if (AWS_ENABLE_JBOF)
     if (NOT TARGET object_rdma)
         message(FATAL_ERROR "AWS_ENABLE_JBOF=ON requires the object_rdma target to be available (add_subdirectory the libobject_rdma project before aws-c-s3).")
     endif()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE AWS_ENABLE_JBOF)
-    # PRIVATE: callers of libaws-c-s3 use the aws_s3_jbof_get_object() API
-    # and don't need to know about the underlying object_rdma symbols.
+    # PUBLIC so that callers see the JBOF enum values in the installed headers.
+    target_compile_definitions(${PROJECT_NAME} PUBLIC AWS_ENABLE_JBOF)
+    # PRIVATE link: callers don't need direct object_rdma symbols.
     target_link_libraries(${PROJECT_NAME} PRIVATE object_rdma)
 endif()
 

@@ -15,6 +15,9 @@
 #include "aws/s3/private/s3_util.h"
 #include "aws/s3/private/s3express_credentials_provider_impl.h"
 #include "aws/s3/s3express_credentials_provider.h"
+#ifdef AWS_ENABLE_JBOF
+#    include "aws/s3/private/s3_jbof_meta_request.h"
+#endif
 
 #include <aws/auth/credentials.h>
 #include <aws/common/assert.h>
@@ -1406,6 +1409,14 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
                 content_length,
                 false /*should_compute_content_md5*/,
                 options);
+#ifdef AWS_ENABLE_JBOF
+        case AWS_S3_META_REQUEST_TYPE_JBOF_GET:
+            return aws_s3_meta_request_jbof_new(
+                client->allocator, client, 0 /*is_put*/, options);
+        case AWS_S3_META_REQUEST_TYPE_JBOF_PUT:
+            return aws_s3_meta_request_jbof_new(
+                client->allocator, client, 1 /*is_put*/, options);
+#endif /* AWS_ENABLE_JBOF */
         default:
             AWS_FATAL_ASSERT(false);
     }

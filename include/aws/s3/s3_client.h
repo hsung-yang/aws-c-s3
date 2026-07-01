@@ -89,6 +89,16 @@ enum aws_s3_meta_request_type {
      */
     AWS_S3_META_REQUEST_TYPE_COPY_OBJECT,
 
+#ifdef AWS_ENABLE_JBOF
+    /* JBOF-direct GetObject via meta-request dispatch. User passes
+     * aws_s3_jbof_meta_request_extra* in options->user_data. */
+    AWS_S3_META_REQUEST_TYPE_JBOF_GET,
+
+    /* JBOF-direct PutObject via meta-request dispatch. User passes
+     * aws_s3_jbof_meta_request_extra* in options->user_data. */
+    AWS_S3_META_REQUEST_TYPE_JBOF_PUT,
+#endif /* AWS_ENABLE_JBOF */
+
     AWS_S3_META_REQUEST_TYPE_MAX,
 };
 
