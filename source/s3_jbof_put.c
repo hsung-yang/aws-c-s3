@@ -380,10 +380,13 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
         return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
     }
 
-    /* Full-object CRC32C: simplistic CPU compute for the demo. Real GPU
-     * path runs nvcomp once over the source_buffer; deferred. */
-    uint32_t full_crc = 0;
-    {
+    /* Full-object CRC32C: try GPU (nvcomp) first; fall back to CPU when
+     * the source isn't CUDA-reachable (or nvcomp fails). */
+    extern uint32_t jbof_put_full_crc_cuda(const void *src, size_t len);
+    uint32_t full_crc = jbof_put_full_crc_cuda(options->source_buffer,
+                                                options->source_length);
+    if (full_crc == 0) {
+        /* CPU fallback (also taken when CRC happens to be 0). */
         static uint32_t table[256];
         static int built = 0;
         if (!built) {

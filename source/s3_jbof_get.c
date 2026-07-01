@@ -363,6 +363,7 @@ static int jbof_parse_extent(struct aws_allocator *alloc,
 struct jbof_target_map {
     const struct aws_s3_jbof_target_device *entries;
     size_t                                  count;
+    int                                     use_o_direct;
 };
 
 static int jbof_open_target(const rp_target_t *target, void *user) {
@@ -372,13 +373,14 @@ static int jbof_open_target(const rp_target_t *target, void *user) {
         if (target->nsid != e->nsid) continue;
         if (e->subnqn.len != strlen(target->subnqn)) continue;
         if (memcmp(target->subnqn, e->subnqn.ptr, e->subnqn.len) != 0) continue;
-        /* match — open the device, NUL-terminating the byte cursor first */
         char path[256];
         size_t n = e->device_path.len < sizeof(path) - 1
                  ? e->device_path.len : sizeof(path) - 1;
         memcpy(path, e->device_path.ptr, n);
         path[n] = '\0';
-        return open(path, O_RDONLY);
+        int flags = O_RDONLY;
+        if (map->use_o_direct) flags |= O_DIRECT;
+        return open(path, flags);
     }
     return -1;
 }
@@ -625,8 +627,9 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     }
 
     struct jbof_target_map map = {
-        .entries = options->target_devices,
-        .count   = options->target_device_count,
+        .entries      = options->target_devices,
+        .count        = options->target_device_count,
+        .use_o_direct = options->use_o_direct,
     };
     rp_planner_config_t pcfg = {
         .worker_threads   = options->workers_per_target,
@@ -635,6 +638,7 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
         .open_target_user = &map,
         .skip_crc         = options->verify_crc ? 0 : 1,
         .async_crc        = options->verify_crc && options->async_crc ? 1 : 0,
+        .use_o_direct     = options->use_o_direct,
     };
     /* Heap-allocate the planner buffer so it can outlive this stack frame
      * when the caller asked for async mode. */
@@ -793,6 +797,7 @@ struct aws_s3_jbof_client {
     char access_key[256], secret_key[256], session_token[1024];
     char region[64], service[32];
     int  signing_enabled;
+    int  use_o_direct;
 };
 
 struct aws_s3_jbof_client *aws_s3_jbof_client_new(
@@ -811,6 +816,7 @@ struct aws_s3_jbof_client *aws_s3_jbof_client_new(
     c->meta_host[hlen] = '\0';
     c->meta_port = options->meta_server_port;
     c->max_cache_entries = options->max_cache_entries ? options->max_cache_entries : 1024;
+    c->use_o_direct = options->use_o_direct;
     pthread_mutex_init(&c->cache_mu, NULL);
     pthread_mutex_init(&c->fd_mu, NULL);
 
@@ -915,7 +921,9 @@ static int jbof_fd_pool_acquire(struct aws_s3_jbof_client *c,
             return fd;
         }
     }
-    int fd = open(device_path, O_RDONLY);
+    int flags = O_RDONLY;
+    if (c->use_o_direct) flags |= O_DIRECT;
+    int fd = open(device_path, flags);
     if (fd < 0) {
         pthread_mutex_unlock(&c->fd_mu);
         return -1;

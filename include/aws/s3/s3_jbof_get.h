@@ -52,6 +52,9 @@ struct aws_s3_jbof_client_options {
     struct aws_byte_cursor session_token;
     struct aws_byte_cursor region;      /* default "us-east-1" if empty */
     struct aws_byte_cursor service;     /* default "s3" if empty */
+
+    /* When non-zero, pool fds opened with O_DIRECT (page cache bypass). */
+    int                    use_o_direct;
 };
 
 struct aws_s3_jbof_get_options {
@@ -98,6 +101,14 @@ struct aws_s3_jbof_get_options {
      * also clips extents to the requested range. */
     uint64_t                                req_range_offset;
     uint64_t                                req_range_length;
+
+    /* When non-zero, open backing devices with O_DIRECT so the kernel
+     * page cache is bypassed. Required for honest saturation measurement
+     * (otherwise iter-2+ becomes a memcpy from RAM, not RDMA). The
+     * caller's gpu_buffer must be sector-aligned (cudaMallocManaged
+     * gives 4 KiB which satisfies typical 512/4096-byte sector
+     * requirements). */
+    int                                     use_o_direct;
 
     /* SigV4 credentials for this single call (only consulted by the
      * standalone aws_s3_jbof_get_object; the cached client carries its
