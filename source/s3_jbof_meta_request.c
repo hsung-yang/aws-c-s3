@@ -45,6 +45,9 @@ struct aws_s3_meta_request_jbof {
     struct aws_s3_jbof_meta_request_extra *extra;
     int                                    is_put;
 
+    /* D2: copied from extra->disable_rdma_on_retry at construction time. */
+    int                                    disable_rdma_on_retry;
+
     /* Written by background pthread; read by finished_request. */
     int completion_error_code;
 
@@ -205,8 +208,9 @@ struct aws_s3_meta_request *aws_s3_meta_request_jbof_new(
         return NULL;
     }
 
-    jbof->extra  = (struct aws_s3_jbof_meta_request_extra *)options->user_data;
-    jbof->is_put = is_put;
+    jbof->extra                 = (struct aws_s3_jbof_meta_request_extra *)options->user_data;
+    jbof->is_put                = is_put;
+    jbof->disable_rdma_on_retry = jbof->extra->disable_rdma_on_retry;
 
     AWS_LOGF_DEBUG(
         AWS_LS_S3_META_REQUEST,
@@ -495,6 +499,15 @@ static void s_jbof_finished_request(
      * Only if the JBOF helper itself succeeded but the framework signaled an
      * infrastructure failure (e.g. pthread_create) do we keep the HTTP error. */
     int final_code = jbof->completion_error_code;
+
+    /* D2: if disable_rdma_on_retry is set and RDMA failed, log and signal
+     * the caller to use the HTTP fallback path instead of retrying RDMA. */
+    if (final_code != AWS_ERROR_SUCCESS && jbof->disable_rdma_on_retry) {
+        fprintf(stderr, "[s3_jbof] RDMA failed, falling back to HTTP\n");
+        jbof->completion_error_code = AWS_ERROR_UNIMPLEMENTED;
+        final_code                  = AWS_ERROR_UNIMPLEMENTED;
+    }
+
     if (final_code == AWS_ERROR_SUCCESS && error_code != AWS_ERROR_SUCCESS) {
         AWS_LOGF_DEBUG(
             AWS_LS_S3_META_REQUEST,

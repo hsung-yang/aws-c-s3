@@ -110,6 +110,12 @@ struct aws_s3_jbof_get_options {
      * requirements). */
     int                                     use_o_direct;
 
+    /* A6: When non-zero, pread targets a CPU-side scratch buffer that is
+     * then copied to gpu_buffer via memcpy (or cudaMemcpy on a CUDA build).
+     * Required on soft-RoCE hosts where ibv_reg_mr cannot register CUDA
+     * memory. Set automatically if SHFT_BOUNCE=1 env var is detected. */
+    int                                     use_bounce_buffer;
+
     /* SigV4 credentials for this single call (only consulted by the
      * standalone aws_s3_jbof_get_object; the cached client carries its
      * own credentials in aws_s3_jbof_client_options). */
@@ -182,6 +188,29 @@ int aws_s3_jbof_client_get_object(
     const struct aws_s3_jbof_get_options *options,
     struct aws_s3_jbof_get_result *out_result);
 
+/* ── A4: callback-based async GET ──────────────────────────────────── */
+
+/* A4: async completion callback. error_code = AWS_OP_SUCCESS or an AWS
+ * error code. Called on a background thread after pread + CRC complete. */
+typedef void (*aws_s3_jbof_get_completion_fn)(
+    int error_code,
+    struct aws_s3_jbof_get_result *result,
+    void *user_data);
+
+/* A4: Submit a GET asynchronously. Returns immediately. The completion
+ * callback fires on a background thread after pread + CRC complete.
+ * The caller must not free options or result until the callback fires.
+ * Returns AWS_OP_SUCCESS if the background thread was launched, or
+ * AWS_OP_ERR if thread creation failed (callback will NOT fire in that
+ * case). */
+AWS_S3_API
+int aws_s3_jbof_client_get_object_async(
+    struct aws_s3_jbof_client *client,
+    const struct aws_s3_jbof_get_options *options,
+    struct aws_s3_jbof_get_result *out_result,
+    aws_s3_jbof_get_completion_fn on_complete,
+    void *user_data);
+
 /* ── Meta-request extra (A5: aws_s3_client_make_meta_request dispatch) ── */
 
 /* Forward declaration; full definition is in s3_jbof_put.h. */
@@ -214,6 +243,11 @@ struct aws_s3_jbof_meta_request_extra {
     struct aws_s3_jbof_get_result           result_out;
     /* PUT result; only populated when type == JBOF_PUT. */
     struct aws_s3_jbof_put_result          *put_result_ptr; /* caller-alloc */
+
+    /* D2: When set, the meta-request falls back to HTTP on RDMA failure
+     * rather than retrying RDMA. Default 0 = RDMA errors are surfaced
+     * to the caller. */
+    int disable_rdma_on_retry;
 };
 
 #ifdef __cplusplus

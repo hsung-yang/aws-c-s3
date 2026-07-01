@@ -57,6 +57,17 @@ struct aws_s3_jbof_put_result {
     uint32_t full_object_crc32c;
 };
 
+/**
+ * Write an object to JBOF storage via 3-phase RDMA:
+ *   1. Placement request (POST /<bucket>/<key>) → write_token + extents
+ *   2. Parallel pwrite to NVMe-oF block devices
+ *   3. Commit (PUT /<bucket>/<key>?rdma-commit) with CRC
+ *
+ * @param allocator     AWS allocator for internal buffers.
+ * @param options       PUT parameters (metadata server, object identity, source buffer).
+ * @param out_result    Output: ETag, bytes written, elapsed time.
+ * @return AWS_OP_SUCCESS or AWS_OP_ERR (check aws_last_error on failure).
+ */
 AWS_S3_API
 int aws_s3_jbof_put_object(struct aws_allocator *allocator,
                            const struct aws_s3_jbof_put_options *options,

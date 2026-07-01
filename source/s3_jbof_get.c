@@ -610,14 +610,40 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     }
 
     /* ── 3. plan → execute ─────────────────────────────────────────── */
+
+    /* A6: Bounce buffer for soft-RoCE hosts where ibv_reg_mr cannot
+     * register CUDA memory. If use_bounce_buffer is set, or the
+     * SHFT_BOUNCE env var is present, pread into a CPU-side scratch
+     * buffer and then copy to gpu_buffer after rp_execute completes.
+     * A6: pass --use-bounce-buffer to demo to test this path */
+
+    /* If ranged, the planner writes req_range_length bytes; otherwise the
+     * full total_bytes. Compute now so bounce is sized correctly. */
+    size_t plan_bytes = options->req_range_length
+                      ? (size_t)options->req_range_length
+                      : total_bytes;
+
+    int need_bounce = options->use_bounce_buffer || (getenv("SHFT_BOUNCE") != NULL);
+    void *bounce = NULL;
+    void *plan_dst = options->gpu_buffer;
+    if (need_bounce) {
+        bounce = malloc(plan_bytes);
+        if (!bounce) {
+            aws_mem_release(allocator, rex);
+            return aws_raise_error(AWS_ERROR_OOM);
+        }
+        plan_dst = bounce;
+    }
+
     rp_read_work_t *work = NULL;
     int             n_work = 0;
-    int rc = rp_plan_build_ranged(rex, (int)n_extents, options->gpu_buffer,
+    int rc = rp_plan_build_ranged(rex, (int)n_extents, plan_dst,
                                   options->req_range_offset,
                                   options->req_range_length,
                                   &work, &n_work);
     aws_mem_release(allocator, rex);
     if (rc != RP_OK) {
+        if (bounce) free(bounce);
         return aws_raise_error(AWS_ERROR_UNKNOWN);
     }
     /* If ranged, the destination buffer holds req_range_length bytes
@@ -645,15 +671,28 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     rp_gpu_object_buffer_t *pbuf = aws_mem_calloc(allocator, 1, sizeof(*pbuf));
     if (!pbuf) {
         free(work);
+        if (bounce) free(bounce);
         return aws_raise_error(AWS_ERROR_OOM);
     }
-    pbuf->data   = options->gpu_buffer;
+    pbuf->data   = plan_dst;
     pbuf->length = total_bytes;
 
     double t0 = jbof_now_sec();
     int prc = rp_execute(work, n_work, pbuf, &pcfg);
     double elapsed = jbof_now_sec() - t0;
     free(work);
+
+    /* A6: copy bounce buffer → gpu_buffer after planner completes. */
+    if (bounce) {
+#ifndef RP_WITHOUT_CUDA
+        cudaMemcpy(options->gpu_buffer, bounce, total_bytes, cudaMemcpyHostToDevice);
+#else
+        memcpy(options->gpu_buffer, bounce, total_bytes);
+#endif
+        free(bounce);
+        bounce = NULL;
+        pbuf->data = options->gpu_buffer;
+    }
 
     out_result->object_bytes     = total_bytes;
     out_result->crc_ok           = pbuf->crc_ok;
@@ -1259,13 +1298,10 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     out_result->lease_expires_at_unix_ms = local_lease_expires;
 
     /* 5. Drive planner using pooled fds. */
-    rp_read_work_t *work = NULL;
-    int n_work = 0;
-    int rc = rp_plan_build_ranged(local_extents, (int)local_n,
-                                  options->gpu_buffer,
-                                  options->req_range_offset,
-                                  options->req_range_length,
-                                  &work, &n_work);
+
+    /* A6: Bounce buffer for soft-RoCE — pread into CPU scratch then copy
+     * to gpu_buffer. Activated by use_bounce_buffer flag or SHFT_BOUNCE
+     * env var. A6: pass --use-bounce-buffer to demo to test this path */
     size_t total_bytes;
     if (options->req_range_length) {
         total_bytes = (size_t)options->req_range_length;
@@ -1274,17 +1310,41 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
         for (size_t i = 0; i < local_n; i++)
             total_bytes += (size_t)local_extents[i].length;
     }
+
+    int need_bounce = options->use_bounce_buffer || (getenv("SHFT_BOUNCE") != NULL);
+    void *bounce = NULL;
+    void *plan_dst = options->gpu_buffer;
+    if (need_bounce) {
+        bounce = malloc(total_bytes);
+        if (!bounce) {
+            aws_mem_release(alloc, local_extents);
+            return aws_raise_error(AWS_ERROR_OOM);
+        }
+        plan_dst = bounce;
+    }
+
+    rp_read_work_t *work = NULL;
+    int n_work = 0;
+    int rc = rp_plan_build_ranged(local_extents, (int)local_n,
+                                  plan_dst,
+                                  options->req_range_offset,
+                                  options->req_range_length,
+                                  &work, &n_work);
     aws_mem_release(alloc, local_extents);
-    if (rc != RP_OK) return jbof_raise_for_planner_rc(rc);
+    if (rc != RP_OK) {
+        if (bounce) free(bounce);
+        return jbof_raise_for_planner_rc(rc);
+    }
     if (total_bytes > options->gpu_buffer_capacity) {
         free(work);
+        if (bounce) free(bounce);
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
 
     int workers = options->workers_per_target > 0 ? options->workers_per_target : 1;
     int *counters = aws_mem_calloc(alloc, options->target_device_count, sizeof(int));
     (void)workers;
-    if (!counters) { free(work); return aws_raise_error(AWS_ERROR_OOM); }
+    if (!counters) { free(work); if (bounce) free(bounce); return aws_raise_error(AWS_ERROR_OOM); }
     struct jbof_pool_ctx pool_ctx = {
         .client    = client,
         .targets   = options->target_devices,
@@ -1294,7 +1354,7 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     pthread_mutex_init(&pool_ctx.counter_mu, NULL);
 
     rp_gpu_object_buffer_t pbuf = {
-        .data   = options->gpu_buffer,
+        .data   = plan_dst,
         .length = total_bytes,
     };
     rp_planner_config_t pcfg = {
@@ -1312,6 +1372,17 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     free(work);
     pthread_mutex_destroy(&pool_ctx.counter_mu);
     aws_mem_release(alloc, counters);
+
+    /* A6: copy bounce buffer → gpu_buffer after planner completes. */
+    if (bounce) {
+#ifndef RP_WITHOUT_CUDA
+        cudaMemcpy(options->gpu_buffer, bounce, total_bytes, cudaMemcpyHostToDevice);
+#else
+        memcpy(options->gpu_buffer, bounce, total_bytes);
+#endif
+        free(bounce);
+        bounce = NULL;
+    }
 
     out_result->object_bytes    = total_bytes;
     out_result->crc_ok          = pbuf.crc_ok;
@@ -1344,6 +1415,58 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     }
 
     return jbof_raise_for_planner_rc(prc);
+}
+
+/* ── A4: callback-based async GET ────────────────────────────────────── */
+
+struct jbof_async_ctx {
+    struct aws_s3_jbof_client       *client;
+    struct aws_s3_jbof_get_options   opts;   /* shallow copy; caller owns deep ptrs */
+    struct aws_s3_jbof_get_result   *out_result;
+    aws_s3_jbof_get_completion_fn    on_complete;
+    void                            *user_data;
+};
+
+static void *jbof_async_thread(void *arg) {
+    struct jbof_async_ctx *ctx = arg;
+    int rc = aws_s3_jbof_client_get_object(ctx->client, &ctx->opts,
+                                            ctx->out_result);
+    ctx->on_complete(rc, ctx->out_result, ctx->user_data);
+    free(ctx);
+    return NULL;
+}
+
+int aws_s3_jbof_client_get_object_async(
+    struct aws_s3_jbof_client *client,
+    const struct aws_s3_jbof_get_options *options,
+    struct aws_s3_jbof_get_result *out_result,
+    aws_s3_jbof_get_completion_fn on_complete,
+    void *user_data)
+{
+    if (!client || !options || !out_result || !on_complete) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+
+    struct jbof_async_ctx *ctx = malloc(sizeof(*ctx));
+    if (!ctx) return aws_raise_error(AWS_ERROR_OOM);
+
+    ctx->client     = client;
+    ctx->opts       = *options;   /* shallow copy; caller owns deep ptrs per API contract */
+    ctx->out_result = out_result;
+    ctx->on_complete = on_complete;
+    ctx->user_data  = user_data;
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int err = pthread_create(&tid, &attr, jbof_async_thread, ctx);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        free(ctx);
+        return aws_raise_error(AWS_ERROR_THREAD_INVALID_SETTINGS);
+    }
+    return AWS_OP_SUCCESS;
 }
 
 #endif /* AWS_ENABLE_JBOF */
