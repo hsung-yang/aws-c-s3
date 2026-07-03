@@ -41,7 +41,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define JBOF_MAX_EXTENTS    64
+/* Sized for the 32 GiB / 4 MiB-extent / 8-target saturation test
+ * (8192 extents). The overlap check below is O(n^2); at 8192 that's
+ * ~33M comparisons, negligible next to a multi-second RDMA transfer. */
+#define JBOF_MAX_EXTENTS    8192
 #define JBOF_HTTP_HDR_BUF   65536
 #define JBOF_HTTP_BODY_BUF  131072
 
@@ -247,7 +250,7 @@ static int jbof_validate_layout(const rp_extent_t *ex, size_t n,
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
 
-    /* O(n^2) overlap check. n is bounded by JBOF_MAX_EXTENTS (64); fine. */
+    /* O(n^2) overlap check. n is bounded by JBOF_MAX_EXTENTS (8192); fine. */
     for (size_t i = 0; i < n; i++) {
         uint64_t a_lo = ex[i].object_offset;
         uint64_t a_hi = a_lo + ex[i].length;
