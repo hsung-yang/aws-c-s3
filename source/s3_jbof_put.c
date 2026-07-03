@@ -410,13 +410,27 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     int csock = jbof_put_tcp_connect(host_z, options->meta_server_port);
     if (csock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
+    /* options->key may already carry a query string (MPU part uploads:
+     * "<key>?partNumber=N&uploadId=X"). Appending "?rdma-commit" in that
+     * case would produce two '?' in the URL, which every URL parser
+     * (including the mock server's) treats as: query = everything after
+     * the FIRST '?', so "rdma-commit" would never be recognized as a
+     * query key and the commit would silently fall through to a
+     * non-RDMA fallback path. Use '&' when a query already exists. */
+    int key_has_query = 0;
+    for (size_t qi = 0; qi < options->key.len; qi++) {
+        if (options->key.ptr[qi] == '?') { key_has_query = 1; break; }
+    }
+    const char *commit_sep = key_has_query ? "&rdma-commit" : "?rdma-commit";
+
     char csig[1536];
-    jbof_put_emit_sig_block(options, "PUT", path, "rdma-commit=", host_port,
-                            csig, sizeof(csig));
+    jbof_put_emit_sig_block(options, "PUT", path,
+                            key_has_query ? "rdma-commit" : "rdma-commit=",
+                            host_port, csig, sizeof(csig));
 
     char creq[2048];
     int crlen = snprintf(creq, sizeof(creq),
-        "PUT /%.*s/%.*s?rdma-commit HTTP/1.0\r\n"
+        "PUT /%.*s/%.*s%s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "X-S3RDMA-Write-Token: %s\r\n"
         "x-amz-checksum-crc32c: %u\r\n"
@@ -425,6 +439,7 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
         "\r\n",
         (int)options->bucket.len, options->bucket.ptr,
         (int)options->key.len,    options->key.ptr,
+        commit_sep,
         host_z, (unsigned)options->meta_server_port,
         write_token,
         full_crc,
