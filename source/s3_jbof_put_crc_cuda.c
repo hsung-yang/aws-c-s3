@@ -16,20 +16,41 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Compute full-object CRC32C of [src, src+len). src must be CUDA-reachable
- * (cudaMallocManaged or device alloc — verified by cudaPointerGetAttributes).
- * Returns 0 on failure (caller falls back to CPU). */
-uint32_t jbof_put_full_crc_cuda(const void *src, size_t len) {
-    if (!src || len == 0) return 0;
+/* Compute full-object CRC32C of [src, src+len).
+ *
+ * Return value is deliberately NOT the CRC itself -- a genuine CRC32C
+ * result can be 0, so overloading 0 as "failure" (the previous contract)
+ * silently corrupted the commit checksum whenever the real CRC happened
+ * to be 0. Success/failure and the CRC value are now fully separate:
+ *
+ *   0  = success; *out_crc holds the CRC32C.
+ *  -1  = src is NOT GPU-reachable (cudaPointerGetAttributes reports
+ *        cudaMemoryTypeUnregistered, i.e. plain host malloc()'d memory).
+ *        This is an expected, non-fatal outcome: such a pointer IS safely
+ *        host-dereferenceable, so the caller may fall back to a CPU
+ *        CRC32C loop over the same bytes.
+ *  -2  = a real CUDA/nvcomp call failed (cudaStreamCreate, cudaMalloc,
+ *        cudaMemcpy, nvcomp calls, or cudaStreamSynchronize) while operating on
+ *        memory we had already confirmed IS GPU-reachable (device,
+ *        managed, or pinned host memory reported by
+ *        cudaPointerGetAttributes). In this case src may be device-only
+ *        memory (e.g. plain cudaMalloc, not cudaMallocManaged/pinned)
+ *        that the CPU cannot dereference at all -- the caller MUST NOT
+ *        attempt a CPU fallback on a -2 return; it must surface an error
+ *        instead of risking a host dereference of device memory.
+ */
+int jbof_put_full_crc_cuda(const void *src, size_t len, uint32_t *out_crc) {
+    if (!src || !out_crc || len == 0) return -2;
 
     /* Verify the pointer is reachable from the GPU. cudaMemoryTypeUnregistered
-     * means plain host malloc — bail out and let the caller fall back. */
+     * means plain host malloc — bail out and let the caller fall back to a
+     * CPU CRC (safe: the memory IS host-dereferenceable in this case). */
     struct cudaPointerAttributes attrs;
-    if (cudaPointerGetAttributes(&attrs, src) != cudaSuccess) return 0;
-    if (attrs.type == cudaMemoryTypeUnregistered) return 0;
+    if (cudaPointerGetAttributes(&attrs, src) != cudaSuccess) return -2;
+    if (attrs.type == cudaMemoryTypeUnregistered) return -1;
 
     cudaStream_t stream;
-    if (cudaStreamCreate(&stream) != cudaSuccess) return 0;
+    if (cudaStreamCreate(&stream) != cudaSuccess) return -2;
 
     /* Single "extent" — one device pointer, one size. */
     const void **d_ptrs = NULL;
@@ -42,7 +63,7 @@ uint32_t jbof_put_full_crc_cuda(const void *src, size_t len) {
         if (d_sizes) cudaFree(d_sizes);
         if (d_crcs)  cudaFree(d_crcs);
         cudaStreamDestroy(stream);
-        return 0;
+        return -2;
     }
 
     const void *h_ptrs[1]  = { src };
@@ -51,7 +72,7 @@ uint32_t jbof_put_full_crc_cuda(const void *src, size_t len) {
         cudaMemcpy(d_sizes, h_sizes, sizeof(size_t), cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(d_ptrs); cudaFree(d_sizes); cudaFree(d_crcs);
         cudaStreamDestroy(stream);
-        return 0;
+        return -2;
     }
 
     nvcompBatchedCRC32Opts_t opts;
@@ -62,29 +83,32 @@ uint32_t jbof_put_full_crc_cuda(const void *src, size_t len) {
             &opts.kernel_conf, len, stream) != nvcompSuccess) {
         cudaFree(d_ptrs); cudaFree(d_sizes); cudaFree(d_crcs);
         cudaStreamDestroy(stream);
-        return 0;
+        return -2;
     }
     if (nvcompBatchedCRC32Async(
             (const void *const *)d_ptrs, d_sizes, 1, d_crcs,
             opts, nvcompCRC32OnlySegment, NULL, stream) != nvcompSuccess) {
         cudaFree(d_ptrs); cudaFree(d_sizes); cudaFree(d_crcs);
         cudaStreamDestroy(stream);
-        return 0;
+        return -2;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         cudaFree(d_ptrs); cudaFree(d_sizes); cudaFree(d_crcs);
         cudaStreamDestroy(stream);
-        return 0;
+        return -2;
     }
 
     uint32_t result = 0;
     if (cudaMemcpy(&result, d_crcs, sizeof(uint32_t),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
-        result = 0;
+        cudaFree(d_ptrs); cudaFree(d_sizes); cudaFree(d_crcs);
+        cudaStreamDestroy(stream);
+        return -2;
     }
     cudaFree(d_ptrs); cudaFree(d_sizes); cudaFree(d_crcs);
     cudaStreamDestroy(stream);
-    return result;
+    *out_crc = result;
+    return 0;
 }
 
 #endif /* AWS_ENABLE_JBOF */

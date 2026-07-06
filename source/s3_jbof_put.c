@@ -13,6 +13,7 @@
 #include <aws/s3/s3_jbof_put.h>
 
 #include <aws/common/byte_buf.h>
+#include <aws/common/encoding.h>
 #include <aws/common/error.h>
 #include <aws/common/json.h>
 #include <aws/common/string.h>
@@ -29,6 +30,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +41,12 @@
 #define JBOF_PUT_MAX_EXTENTS    1024
 #define JBOF_PUT_HDR_BUF        65536
 #define JBOF_PUT_BODY_BUF       131072
+/* URI-encoding scratch sizes: S3 keys are capped at 1024 raw bytes, but
+ * percent-encoding can triple that in the worst case (every byte -> "%XX");
+ * bucket names are capped at 63 raw bytes. Generous vs. both limits. */
+#define JBOF_PUT_BUCKET_ENC_BUF 256
+#define JBOF_PUT_KEY_ENC_BUF    4096
+#define JBOF_PUT_PATH_BUF       (JBOF_PUT_BUCKET_ENC_BUF + JBOF_PUT_KEY_ENC_BUF + 512)
 
 /* ── small HTTP / time helpers (mirror s3_jbof_get.c) ──────────────── */
 
@@ -149,6 +157,15 @@ static void jbof_put_emit_sig_block(const struct aws_s3_jbof_put_options *o,
         "X-Amz-Content-SHA256: %s\r\n"
         "Authorization: %s\r\n",
         svo.amz_date, svo.content_sha256, svo.authorization);
+    if (n < 0 || (size_t)n >= cap) {
+        /* Truncated (or encoding error). Bail out to an empty sig block
+         * rather than let the session-token append below compute
+         * `out + n` / `cap - n` with n >= cap -- that pointer/size pair
+         * would be out of bounds and the subsequent snprintf would write
+         * past the end of `out`. */
+        out[0] = '\0';
+        return;
+    }
     if (o->session_token.len) {
         char st2[1024];
         size_t nt = o->session_token.len < sizeof(st2) - 1
@@ -157,6 +174,74 @@ static void jbof_put_emit_sig_block(const struct aws_s3_jbof_put_options *o,
         st2[nt] = '\0';
         snprintf(out + n, cap - n, "X-Amz-Security-Token: %s\r\n", st2);
     }
+}
+
+/* ── URI encoding (object keys/bucket names may contain reserved bytes) ── */
+
+/* Percent-encode every byte of `in` except the unreserved set
+ * [A-Za-z0-9-._~] and '/' (kept raw since keys are path segments and
+ * routinely contain '/'). Mirrors snprintf()'s truncation convention:
+ * returns the number of bytes that WOULD have been written (excluding
+ * the NUL), so the caller can detect truncation via `return >= out_cap`
+ * exactly like the snprintf() call sites elsewhere in this file. Always
+ * NUL-terminates within out_cap when out_cap > 0. */
+static size_t jbof_put_uri_encode(const char *in, size_t in_len,
+                                  char *out, size_t out_cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t needed = 0;
+    size_t oi = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                         (c >= '0' && c <= '9') ||
+                         c == '-' || c == '.' || c == '_' || c == '~' || c == '/';
+        if (unreserved) {
+            needed += 1;
+            if (out_cap > 0 && oi + 1 < out_cap) out[oi++] = (char)c;
+        } else {
+            needed += 3;
+            if (out_cap > 0 && oi + 3 < out_cap) {
+                out[oi++] = '%';
+                out[oi++] = hex[(c >> 4) & 0xF];
+                out[oi++] = hex[c & 0xF];
+            }
+        }
+    }
+    if (out_cap > 0) out[oi < out_cap ? oi : out_cap - 1] = '\0';
+    return needed;
+}
+
+/* ── CPU CRC32C fallback (used only when the source buffer is confirmed
+ * to be plain host memory that jbof_put_full_crc_cuda() could not/would
+ * not touch on the GPU -- see the call site in aws_s3_jbof_put_object()
+ * and the return-code contract documented in s3_jbof_put_crc_cuda.c). ── */
+
+static uint32_t jbof_put_crc32c_table[256];
+static pthread_once_t jbof_put_crc32c_once = PTHREAD_ONCE_INIT;
+
+static void jbof_put_crc32c_table_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0x82F63B78u & -(int32_t)(c & 1));
+        jbof_put_crc32c_table[i] = c;
+    }
+}
+
+/* CRC32C (Castagnoli) over [buf, buf+len). The table used to be built
+ * behind a plain `static int built` flag with no synchronization -- two
+ * PUTs racing on first use could have one thread read table[] entries
+ * that the other thread hadn't finished writing yet (a real data race,
+ * not just a benign redundant-init). pthread_once guarantees the table
+ * is fully built, with the necessary memory barrier, before any caller
+ * proceeds. */
+static uint32_t jbof_put_crc32c_cpu(const void *buf, size_t len) {
+    pthread_once(&jbof_put_crc32c_once, jbof_put_crc32c_table_init);
+    uint32_t crc = 0xFFFFFFFFu;
+    const uint8_t *p = buf;
+    for (size_t i = 0; i < len; i++)
+        crc = (crc >> 8) ^ jbof_put_crc32c_table[(crc ^ p[i]) & 0xFF];
+    return crc ^ 0xFFFFFFFFu;
 }
 
 /* ── target-device → fd resolver (open RDWR for PUT) ───────────────── */
@@ -252,10 +337,46 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     int sock = jbof_put_tcp_connect(host_z, options->meta_server_port);
     if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
-    char path[512];
-    snprintf(path, sizeof(path), "/%.*s/%.*s",
-             (int)options->bucket.len, options->bucket.ptr,
-             (int)options->key.len, options->key.ptr);
+    /* Build the request path with the bucket/key percent-encoded (a raw
+     * '?' or space in a key used to truncate/corrupt the request line --
+     * see the fix note above jbof_put_uri_encode()). options->key may
+     * already carry a literal query string for MPU part uploads
+     * ("<key>?partNumber=N&uploadId=X" -- see the commit-phase comment
+     * below); that tail is intentionally left unescaped and passed
+     * through as-is, only the actual key path segment before the first
+     * '?' is encoded. `path` is reused verbatim for both SigV4 signing
+     * (canonical_uri) and the literal HTTP request line below and at
+     * commit time, so signing and the wire request can never diverge. */
+    char path[JBOF_PUT_PATH_BUF];
+    {
+        char bucket_enc[JBOF_PUT_BUCKET_ENC_BUF];
+        size_t bucket_needed = jbof_put_uri_encode(
+            options->bucket.ptr, options->bucket.len, bucket_enc, sizeof(bucket_enc));
+        if (bucket_needed >= sizeof(bucket_enc)) {
+            close(sock);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+
+        size_t key_path_len = options->key.len;
+        for (size_t qi = 0; qi < options->key.len; qi++) {
+            if (options->key.ptr[qi] == '?') { key_path_len = qi; break; }
+        }
+        char key_enc[JBOF_PUT_KEY_ENC_BUF];
+        size_t key_needed = jbof_put_uri_encode(
+            options->key.ptr, key_path_len, key_enc, sizeof(key_enc));
+        if (key_needed >= sizeof(key_enc)) {
+            close(sock);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+
+        int pathlen = snprintf(path, sizeof(path), "/%s/%s%.*s",
+            bucket_enc, key_enc,
+            (int)(options->key.len - key_path_len), options->key.ptr + key_path_len);
+        if (pathlen < 0 || (size_t)pathlen >= sizeof(path)) {
+            close(sock);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+    }
     char host_port[96];
     snprintf(host_port, sizeof(host_port), "%s:%u",
              host_z, (unsigned)options->meta_server_port);
@@ -263,20 +384,28 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     jbof_put_emit_sig_block(options, "PUT", path, "", host_port,
                             sig_block, sizeof(sig_block));
 
-    char req[2048];
+    char req[JBOF_PUT_PATH_BUF + 1536 + 512];
     int reqlen = snprintf(req, sizeof(req),
-        "PUT /%.*s/%.*s HTTP/1.0\r\n"
+        "PUT %s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "Accept: application/vnd.s3rdma.placement+json\r\n"
         "X-S3RDMA-Object-Size: %zu\r\n"
         "Content-Length: 0\r\n"
         "%s"
         "\r\n",
-        (int)options->bucket.len, options->bucket.ptr,
-        (int)options->key.len,    options->key.ptr,
+        path,
         host_z, (unsigned)options->meta_server_port,
         options->source_length,
         sig_block);
+    if (reqlen < 0 || (size_t)reqlen >= sizeof(req)) {
+        /* snprintf() returns the length that WOULD have been written,
+         * ignoring truncation. If bucket+key+sig_block overflow req[],
+         * reqlen > sizeof(req) and the send below would read (size_t)reqlen
+         * bytes starting at req -- past the end of the stack buffer. Reject
+         * instead of sending garbage/OOB memory over the wire. */
+        close(sock);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
     if (jbof_put_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
@@ -342,6 +471,23 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
             aws_json_value_destroy(root);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
+        /* wp_plan_build() (write_planner.c) computes each work item's
+         * source pointer as source_base + extent.object_offset and reads
+         * extent.length bytes from there -- it has no visibility into
+         * options->source_length and trusts the server-supplied extent
+         * verbatim. A malicious or buggy metadata server can therefore
+         * hand back an object_offset (or object_offset+length) beyond the
+         * caller's source_buffer, causing wp_plan_build/pwrite to read
+         * past the end of source_buffer (info leak of adjacent memory
+         * onto disk, or a SIGSEGV). Validate here, before the pointer
+         * arithmetic ever happens. The order below (offset check first)
+         * avoids unsigned underflow in the subtraction. */
+        if (placement[i].object_offset > (uint64_t)options->source_length ||
+            placement[i].length > (uint64_t)options->source_length - placement[i].object_offset) {
+            aws_mem_release(allocator, placement);
+            aws_json_value_destroy(root);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
         total_bytes += (size_t)placement[i].length;
     }
     aws_json_value_destroy(root);
@@ -377,34 +523,66 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     free(work);
     if (prc != RP_OK) {
         wp_write_result_clean_up(&wr);
+        /* TODO(remaining_for_complete_client.md): the metadata server has
+         * already reserved LBAs and handed us `write_token` in phase 1
+         * (above). On this failure path we bail out without telling the
+         * server the placement is dead, leaking those reserved extents
+         * server-side until some (currently nonexistent) GC/lease-expiry
+         * mechanism reclaims them. There is no release/abort endpoint for
+         * a single-part PUT's write_token in RDMA_PROTOCOL_SPEC.md today
+         * (aws_s3_jbof_mpu_abort() in s3_jbof_mpu.c is a different,
+         * MPU-only protocol and endpoint -- not reusable here). Client-side
+         * memory is correctly freed either way; do not invent a new server
+         * endpoint from the client side. */
         return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
     }
 
-    /* Full-object CRC32C: try GPU (nvcomp) first; fall back to CPU when
-     * the source isn't CUDA-reachable (or nvcomp fails). */
-    extern uint32_t jbof_put_full_crc_cuda(const void *src, size_t len);
-    uint32_t full_crc = jbof_put_full_crc_cuda(options->source_buffer,
-                                                options->source_length);
-    if (full_crc == 0) {
-        /* CPU fallback (also taken when CRC happens to be 0). */
-        static uint32_t table[256];
-        static int built = 0;
-        if (!built) {
-            for (uint32_t i = 0; i < 256; i++) {
-                uint32_t c = i;
-                for (int k = 0; k < 8; k++)
-                    c = (c >> 1) ^ (0x82F63B78u & -(int32_t)(c & 1));
-                table[i] = c;
-            }
-            built = 1;
-        }
-        full_crc = 0xFFFFFFFFu;
-        const uint8_t *p = options->source_buffer;
-        for (size_t i = 0; i < options->source_length; i++)
-            full_crc = (full_crc >> 8) ^ table[(full_crc ^ p[i]) & 0xFF];
-        full_crc ^= 0xFFFFFFFFu;
+    /* Full-object CRC32C for the commit phase. Try GPU (nvcomp) first;
+     * jbof_put_full_crc_cuda() reports success/failure via an explicit
+     * out-param + return code (see s3_jbof_put_crc_cuda.c) instead of the
+     * old "0 means failure" sentinel, which was wrong: a real CRC32C can
+     * legitimately be 0.
+     *
+     * Return code contract:
+     *   0  -> success, full_crc is valid.
+     *  -1  -> source_buffer is confirmed plain host memory (not
+     *         GPU-reachable). Safe, expected fallback case: CPU-CRC it.
+     *  -2  -> a genuine CUDA/nvcomp call failed while operating on memory
+     *         already confirmed GPU-reachable (device/managed/pinned).
+     *         In this case source_buffer may be device-only memory that
+     *         the CPU cannot dereference at all -- the old code ran the
+     *         same per-byte CPU loop unconditionally on ANY failure,
+     *         which is a guaranteed SIGSEGV / undefined behavior against
+     *         device-only memory. There is no reliable "is host
+     *         reachable" flag on aws_s3_jbof_put_options to disambiguate
+     *         further (adding one is out of scope for this fix), so the
+     *         only safe action here is to fail the PUT instead of
+     *         gambling on a host dereference of unknown memory. */
+    extern int jbof_put_full_crc_cuda(const void *src, size_t len, uint32_t *out_crc);
+    uint32_t full_crc = 0;
+    int crc_rc = jbof_put_full_crc_cuda(options->source_buffer, options->source_length, &full_crc);
+    if (crc_rc == -1) {
+        full_crc = jbof_put_crc32c_cpu(options->source_buffer, options->source_length);
+    } else if (crc_rc != 0) {
+        wp_write_result_clean_up(&wr);
+        return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
     }
     wp_write_result_clean_up(&wr);
+
+    /* S3 spec requires x-amz-checksum-crc32c to be the base64 encoding of
+     * the 4-byte big-endian CRC32C, not a decimal integer -- the previous
+     * "%u" here sent e.g. "3735928559" instead of "3q2+7w==", which no
+     * spec-compliant S3 checksum validator would accept. */
+    uint8_t crc_be[4] = {
+        (uint8_t)(full_crc >> 24), (uint8_t)(full_crc >> 16),
+        (uint8_t)(full_crc >> 8),  (uint8_t)(full_crc),
+    };
+    struct aws_byte_cursor crc_cursor = aws_byte_cursor_from_array(crc_be, sizeof(crc_be));
+    uint8_t crc_b64_bytes[16];
+    struct aws_byte_buf crc_b64_buf = aws_byte_buf_from_empty_array(crc_b64_bytes, sizeof(crc_b64_bytes));
+    if (aws_base64_encode(&crc_cursor, &crc_b64_buf) != AWS_OP_SUCCESS) {
+        return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
+    }
 
     /* ── Phase 3: commit ──────────────────────────────────────────── */
     int csock = jbof_put_tcp_connect(host_z, options->meta_server_port);
@@ -428,22 +606,29 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
                             key_has_query ? "rdma-commit" : "rdma-commit=",
                             host_port, csig, sizeof(csig));
 
-    char creq[2048];
+    char creq[JBOF_PUT_PATH_BUF + 1536 + 512];
     int crlen = snprintf(creq, sizeof(creq),
-        "PUT /%.*s/%.*s%s HTTP/1.0\r\n"
+        "PUT %s%s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "X-S3RDMA-Write-Token: %s\r\n"
-        "x-amz-checksum-crc32c: %u\r\n"
+        "x-amz-checksum-crc32c: %.*s\r\n"
         "Content-Length: 0\r\n"
         "%s"
         "\r\n",
-        (int)options->bucket.len, options->bucket.ptr,
-        (int)options->key.len,    options->key.ptr,
+        path,
         commit_sep,
         host_z, (unsigned)options->meta_server_port,
         write_token,
-        full_crc,
+        (int)crc_b64_buf.len, (const char *)crc_b64_buf.buffer,
         csig);
+    if (crlen < 0 || (size_t)crlen >= sizeof(creq)) {
+        /* Same truncation-detection fix as the phase-1 request above:
+         * snprintf()'s return value ignores truncation, so without this
+         * check an oversized bucket/key/csig would make crlen exceed
+         * sizeof(creq) and the send below would read past the buffer. */
+        close(csock);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
     if (jbof_put_send_all(csock, creq, (size_t)crlen) < 0) {
         close(csock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);

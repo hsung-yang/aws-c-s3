@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -170,6 +171,31 @@ static void hex_lower(const uint8_t *bytes, size_t n, char *out) {
 static const char EMPTY_BODY_SHA256[] =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/* One canonical header (name, value) as a (pointer, length) pair — never
+ * copied, always a slice into a caller-owned string that outlives this
+ * call (host_header / out->content_sha256 / out->amz_date / session_token /
+ * extra_signed_headers_block). Keeping slices instead of copies means an
+ * oversized value (e.g. a long session token) simply fails the later
+ * bounds-checked append instead of being silently truncated. */
+struct jbof_hdr {
+    const char *name;
+    size_t      name_len;
+    const char *value;
+    size_t      value_len;
+};
+
+#define JBOF_SIGV4_MAX_HEADERS 16
+
+static int jbof_hdr_cmp(const void *a, const void *b) {
+    const struct jbof_hdr *ha = (const struct jbof_hdr *)a;
+    const struct jbof_hdr *hb = (const struct jbof_hdr *)b;
+    size_t min_len = ha->name_len < hb->name_len ? ha->name_len : hb->name_len;
+    int c = memcmp(ha->name, hb->name, min_len);
+    if (c != 0) return c;
+    if (ha->name_len != hb->name_len) return ha->name_len < hb->name_len ? -1 : 1;
+    return 0;
+}
+
 int aws_s3_jbof_sigv4_sign(const struct aws_s3_jbof_sigv4_input *in,
                            struct aws_s3_jbof_sigv4_output *out) {
     if (!in || !out || !in->method || !in->canonical_uri || !in->host_header ||
@@ -181,9 +207,18 @@ int aws_s3_jbof_sigv4_sign(const struct aws_s3_jbof_sigv4_input *in,
     time_t now = (time_t)(in->timestamp ? in->timestamp : (uint64_t)time(NULL));
     struct tm tm_utc;
 #if defined(_WIN32)
-    gmtime_s(&tm_utc, &now);
+    /* gmtime_s() returns 0 on success (errno_t convention). */
+    if (gmtime_s(&tm_utc, &now) != 0) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
 #else
-    gmtime_r(&now, &tm_utc);
+    /* gmtime_r() returns NULL on a degenerate/out-of-range time_t, leaving
+     * tm_utc uninitialized. Signing with garbage struct tm contents would
+     * produce a signature over a bogus date without any indication of
+     * failure, so this must be checked rather than ignored. */
+    if (gmtime_r(&now, &tm_utc) == NULL) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
 #endif
     char date_short[16];
     snprintf(out->amz_date, sizeof(out->amz_date),
@@ -198,44 +233,120 @@ int aws_s3_jbof_sigv4_sign(const struct aws_s3_jbof_sigv4_input *in,
     snprintf(out->content_sha256, sizeof(out->content_sha256),
              "%s", EMPTY_BODY_SHA256);
 
-    /* Canonical headers (lower-case names, sorted lexicographically).
-     * We always sign: host, x-amz-content-sha256, x-amz-date. Optionally
-     * x-amz-security-token + any extras the caller supplied. */
-    char canonical_headers[2048];
-    char signed_headers[512];
+    /* Canonical headers (lower-case names, sorted lexicographically) and
+     * the matching SignedHeaders list. SigV4 requires both to be sorted by
+     * lowercase header name — an unsorted list produces a signature the
+     * server (or any independent verifier) will reject. We always sign:
+     * host, x-amz-content-sha256, x-amz-date. Optionally
+     * x-amz-security-token + any extras the caller supplied via
+     * extra_signed_headers_block ("name:value\n" repeated, one header per
+     * line, lower-case names, trailing newline required — see the header
+     * doc comment). Every header is gathered into a bounded array first,
+     * then sorted, so callers do not need to pre-sort extras themselves
+     * and cannot land them in the wrong position relative to the fixed
+     * x-amz-* headers. */
+    struct jbof_hdr headers[JBOF_SIGV4_MAX_HEADERS];
+    size_t nheaders = 0;
     int needs_token = in->session_token && in->session_token[0];
 
-    /* Insert in sorted order. Names known to be sorted:
-     *   host < x-amz-content-sha256 < x-amz-date < x-amz-security-token
-     * Extras (caller-supplied) come in the right place by being added
-     * AFTER host but BEFORE x-amz-* (we don't validate the caller's
-     * order). For now, require extras to be sorted by the caller and
-     * start with names < "x-amz-*". */
-    int chn = snprintf(canonical_headers, sizeof(canonical_headers),
-                       "host:%s\n", in->host_header);
-    int shn = snprintf(signed_headers, sizeof(signed_headers), "host");
+    headers[nheaders].name = "host";
+    headers[nheaders].name_len = 4;
+    headers[nheaders].value = in->host_header;
+    headers[nheaders].value_len = strlen(in->host_header);
+    nheaders++;
 
-    if (in->extra_signed_headers_block && in->extra_signed_headers_block[0]) {
-        chn += snprintf(canonical_headers + chn, sizeof(canonical_headers) - chn,
-                        "%s", in->extra_signed_headers_block);
-        shn += snprintf(signed_headers + shn, sizeof(signed_headers) - shn,
-                        ";%s", in->extra_signed_headers_names);
-    }
-    chn += snprintf(canonical_headers + chn, sizeof(canonical_headers) - chn,
-                    "x-amz-content-sha256:%s\nx-amz-date:%s\n",
-                    out->content_sha256, out->amz_date);
-    shn += snprintf(signed_headers + shn, sizeof(signed_headers) - shn,
-                    ";x-amz-content-sha256;x-amz-date");
+    headers[nheaders].name = "x-amz-content-sha256";
+    headers[nheaders].name_len = 20;
+    headers[nheaders].value = out->content_sha256;
+    headers[nheaders].value_len = strlen(out->content_sha256);
+    nheaders++;
+
+    headers[nheaders].name = "x-amz-date";
+    headers[nheaders].name_len = 10;
+    headers[nheaders].value = out->amz_date;
+    headers[nheaders].value_len = strlen(out->amz_date);
+    nheaders++;
+
     if (needs_token) {
-        chn += snprintf(canonical_headers + chn, sizeof(canonical_headers) - chn,
-                        "x-amz-security-token:%s\n", in->session_token);
-        shn += snprintf(signed_headers + shn, sizeof(signed_headers) - shn,
-                        ";x-amz-security-token");
+        if (nheaders >= JBOF_SIGV4_MAX_HEADERS) {
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        headers[nheaders].name = "x-amz-security-token";
+        headers[nheaders].name_len = 20;
+        headers[nheaders].value = in->session_token;
+        headers[nheaders].value_len = strlen(in->session_token);
+        nheaders++;
     }
+
+    /* Parse extra_signed_headers_block into individual (name, value)
+     * slices — no copying, so an oversized value cannot be truncated here
+     * either. extra_signed_headers_names is accepted for API/source
+     * compatibility with existing callers but is no longer load-bearing:
+     * names and sort order are now derived directly from the block. */
+    if (in->extra_signed_headers_block && in->extra_signed_headers_block[0]) {
+        const char *p = in->extra_signed_headers_block;
+        while (*p) {
+            const char *line_end = strchr(p, '\n');
+            if (!line_end) {
+                /* Malformed: every line must end in '\n' per the
+                 * documented contract. */
+                return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            }
+            const char *colon = (const char *)memchr(p, ':', (size_t)(line_end - p));
+            if (!colon) {
+                return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            }
+            if (nheaders >= JBOF_SIGV4_MAX_HEADERS) {
+                return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            }
+            headers[nheaders].name = p;
+            headers[nheaders].name_len = (size_t)(colon - p);
+            headers[nheaders].value = colon + 1;
+            headers[nheaders].value_len = (size_t)(line_end - (colon + 1));
+            nheaders++;
+            p = line_end + 1;
+        }
+    }
+
+    qsort(headers, nheaders, sizeof(headers[0]), jbof_hdr_cmp);
+
+    /* Emit both lists from the sorted array with an explicit remaining-
+     * capacity check on every append. Any header set that would not fit
+     * fails the signing call instead of overflowing the stack buffer or
+     * silently truncating (and thus signing a different value than what
+     * ends up on the wire). */
+    char canonical_headers[8192];
+    char signed_headers[512];
+    size_t ch_off = 0, sh_off = 0;
+    for (size_t i = 0; i < nheaders; i++) {
+        size_t ch_need = headers[i].name_len + 1 /* ':' */ + headers[i].value_len + 1 /* '\n' */;
+        if (ch_off + ch_need >= sizeof(canonical_headers)) {
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        memcpy(canonical_headers + ch_off, headers[i].name, headers[i].name_len);
+        ch_off += headers[i].name_len;
+        canonical_headers[ch_off++] = ':';
+        memcpy(canonical_headers + ch_off, headers[i].value, headers[i].value_len);
+        ch_off += headers[i].value_len;
+        canonical_headers[ch_off++] = '\n';
+
+        size_t sh_need = headers[i].name_len + (i > 0 ? 1 : 0) /* ';' */;
+        if (sh_off + sh_need >= sizeof(signed_headers)) {
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        if (i > 0) signed_headers[sh_off++] = ';';
+        memcpy(signed_headers + sh_off, headers[i].name, headers[i].name_len);
+        sh_off += headers[i].name_len;
+    }
+    canonical_headers[ch_off] = '\0';
+    signed_headers[sh_off] = '\0';
 
     /* Canonical request = method + uri + query + canonical_headers + "" +
-     *                     signed_headers + payload_hash */
-    char canonical_request[4096];
+     *                     signed_headers + payload_hash
+     * Sized with headroom above canonical_headers[] (8192) + signed_headers[]
+     * (512) + method/uri/query/hash so a full canonical_headers block never
+     * gets truncated here after already having fit above. */
+    char canonical_request[12288];
     int crn = snprintf(canonical_request, sizeof(canonical_request),
                        "%s\n%s\n%s\n%s\n%s\n%s",
                        in->method,
@@ -264,9 +375,23 @@ int aws_s3_jbof_sigv4_sign(const struct aws_s3_jbof_sigv4_input *in,
              "AWS4-HMAC-SHA256\n%s\n%s\n%s",
              out->amz_date, credential_scope, cr_hash_hex);
 
-    /* Signing key. */
-    char kSecret[256];
-    snprintf(kSecret, sizeof(kSecret), "AWS4%s", in->secret_key);
+    /* Signing key. "AWS4" + secret_key must survive intact: a truncated
+     * kSecret here derives a signing key from a different (shorter) secret
+     * than the one actually configured, which silently produces a
+     * signature nobody with the real secret can reproduce or verify. Fail
+     * rather than truncate. (Note: hmac_sha256() itself correctly handles
+     * keys longer than the SHA-256 block size per RFC 2104 by hashing them
+     * first — the bug here was purely the snprintf truncation before that
+     * point is ever reached.) */
+    char kSecret[512];
+    size_t secret_len = strlen(in->secret_key);
+    if (secret_len > sizeof(kSecret) - 5 /* "AWS4" + NUL */) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+    int ksn = snprintf(kSecret, sizeof(kSecret), "AWS4%s", in->secret_key);
+    if (ksn < 0 || (size_t)ksn >= sizeof(kSecret)) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
 
     uint8_t kDate[SHA256_DIGEST_BYTES];
     uint8_t kRegion[SHA256_DIGEST_BYTES];

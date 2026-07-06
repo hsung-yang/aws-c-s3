@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <aws/s3/s3_jbof_mpu.h>
 #include <aws/s3/s3_jbof_put.h>
+#include <aws/s3/s3_jbof_sigv4.h>
 
 #include <aws/common/allocator.h>
 #include <aws/common/error.h>
@@ -39,8 +40,18 @@
 
 #define JBOF_MPU_HDR_BUF    65536
 #define JBOF_MPU_BODY_BUF   131072
-#define JBOF_MPU_XML_BUF    524288   /* 512 KiB: up to 10000 parts × ~50 bytes */
 #define JBOF_MPU_KEY_MAX    1024     /* max key length including query suffix */
+
+/* Per-part worst case for the CompleteMultipartUpload XML body:
+ *   <Part><PartNumber>NNNNNNNNNNN</PartNumber><ETag>%s</ETag></Part>
+ * literal tags (~51 bytes) + up to 11 digits for a (possibly caller-
+ * supplied, unvalidated) part number + up to sizeof(part_result->etag)-1
+ * (127) ETag bytes. Rounded up with margin. The old fixed 512 KiB
+ * JBOF_MPU_XML_BUF could not hold JBOF_MPU_MAX_PARTS (10000) parts with
+ * near-max-length ETags (up to ~2 MiB needed) and silently truncated the
+ * request; the XML body is now sized from the actual part_count instead. */
+#define JBOF_MPU_XML_PART_MAX 256
+#define JBOF_MPU_XML_WRAP_MAX 128   /* "<CompleteMultipartUpload>" + close tag + slack */
 
 /* ── opaque handle ────────────────────────────────────────────────────── */
 
@@ -163,6 +174,28 @@ static void jbof_mpu_parse_upload_id(const char *body, char *out, size_t outsz) 
     out[i] = '\0';
 }
 
+/* Standard S3 InitiateMultipartUploadResult XML fallback:
+ * <UploadId>...</UploadId>, trimming surrounding whitespace. Used when the
+ * server returns a plain S3 XML body instead of the JSON "upload_id" field
+ * or the X-Upload-ID header. */
+static void jbof_mpu_parse_upload_id_xml(const char *body, char *out, size_t outsz) {
+    out[0] = '\0';
+    const char *start = strstr(body, "<UploadId>");
+    if (!start) return;
+    start += strlen("<UploadId>");
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
+    const char *end = strstr(start, "</UploadId>");
+    if (!end || end < start) return;
+    while (end > start &&
+           (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) {
+        end--;
+    }
+    size_t len = (size_t)(end - start);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+}
+
 /* Extract the final ETag from the CompleteMultipartUpload XML response.
  * Looks for <ETag>...</ETag> at the top level (not inside <Part>). */
 static void jbof_mpu_parse_final_etag(const char *body, char *out, size_t outsz) {
@@ -191,6 +224,74 @@ static void jbof_mpu_cursor_to_buf(struct aws_byte_cursor cur,
     size_t n = cur.len < bufsz - 1 ? cur.len : bufsz - 1;
     if (n) memcpy(buf, cur.ptr, n);
     buf[n] = '\0';
+}
+
+/* Like jbof_mpu_cursor_to_buf, but fails instead of silently truncating.
+ * A key of exactly (bufsz - 1) bytes fits; anything longer is rejected so
+ * the upload never silently lands under a truncated (i.e. wrong) key.
+ * Returns 0 on success, -1 if cur does not fit in buf. */
+static int jbof_mpu_cursor_to_buf_checked(struct aws_byte_cursor cur,
+                                          char *buf, size_t bufsz) {
+    if (cur.len >= bufsz) return -1;
+    if (cur.len) memcpy(buf, cur.ptr, cur.len);
+    buf[cur.len] = '\0';
+    return 0;
+}
+
+/* ── SigV4 header block for MPU control-plane requests ──────────────── */
+
+/* Emit signed headers (X-Amz-Date, X-Amz-Content-SHA256, Authorization,
+ * [X-Amz-Security-Token]) for CreateMultipartUpload / CompleteMultipartUpload
+ * / AbortMultipartUpload requests when credentials are present, mirroring
+ * s3_jbof_put.c's jbof_put_emit_sig_block. That helper is static to
+ * s3_jbof_put.c, so rather than widen its header surface we call the shared
+ * aws_s3_jbof_sigv4_sign() API directly — the mpu struct's string fields are
+ * already null-terminated copies (see aws_s3_jbof_mpu_create), so no extra
+ * cursor->buffer copying is needed here. out[0] is left '\0' (no headers
+ * emitted) when no credentials were supplied. */
+/* NOTE(sigv4-mpu-encoding): `path`/`query` are passed through as-is (no
+ * percent-encoding) — self-consistent with the literal, also-unencoded
+ * bucket/key baked into the HTTP request lines below, so the signature
+ * matches what actually goes on the wire to *this* metadata server. This
+ * will not match a strict standard-S3 SigV4 verifier's expectations for
+ * keys containing reserved characters; if that interop matters, encode
+ * both the canonical_uri here and the literal request-line path together
+ * (see s3_jbof_put.c's uri-encoding helper for the reference approach). */
+static void jbof_mpu_emit_sig_block(const struct aws_s3_jbof_mpu *mpu,
+                                    const char *method, const char *path,
+                                    const char *query, const char *host_port,
+                                    char *out, size_t cap) {
+    out[0] = '\0';
+    if (!mpu->_access_key[0] || !mpu->_secret_key[0]) return;
+
+    struct aws_s3_jbof_sigv4_input in = {
+        .method          = method,
+        .canonical_uri   = path,
+        .canonical_query = query,
+        .host_header     = host_port,
+        .region          = mpu->_region[0]  ? mpu->_region  : "us-east-1",
+        .service         = mpu->_service[0] ? mpu->_service : "s3",
+        .access_key      = mpu->_access_key,
+        .secret_key      = mpu->_secret_key,
+        .session_token   = mpu->_session_token[0] ? mpu->_session_token : NULL,
+    };
+    struct aws_s3_jbof_sigv4_output svo;
+    memset(&svo, 0, sizeof(svo));
+    if (aws_s3_jbof_sigv4_sign(&in, &svo) != AWS_OP_SUCCESS) return;
+
+    int n = snprintf(out, cap,
+        "X-Amz-Date: %s\r\n"
+        "X-Amz-Content-SHA256: %s\r\n"
+        "Authorization: %s\r\n",
+        svo.amz_date, svo.content_sha256, svo.authorization);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return;
+    }
+    if (mpu->_session_token[0]) {
+        snprintf(out + n, cap - (size_t)n,
+                 "X-Amz-Security-Token: %s\r\n", mpu->_session_token);
+    }
 }
 
 /* ── aws_s3_jbof_mpu_create ──────────────────────────────────────────── */
@@ -229,7 +330,13 @@ struct aws_s3_jbof_mpu *aws_s3_jbof_mpu_create(
      * rebuild cursors to point into those buffers. */
     jbof_mpu_cursor_to_buf(options->meta_server_host, mpu->_host,    sizeof(mpu->_host));
     jbof_mpu_cursor_to_buf(options->bucket,           mpu->_bucket,  sizeof(mpu->_bucket));
-    jbof_mpu_cursor_to_buf(options->key,              mpu->_key,     sizeof(mpu->_key));
+    if (jbof_mpu_cursor_to_buf_checked(options->key, mpu->_key, sizeof(mpu->_key)) != 0) {
+        /* Key too long to fit — fail loudly instead of silently truncating
+         * (which would upload under a different, wrong key). */
+        aws_mem_release(allocator, mpu);
+        aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        return NULL;
+    }
     jbof_mpu_cursor_to_buf(options->access_key,       mpu->_access_key,    sizeof(mpu->_access_key));
     jbof_mpu_cursor_to_buf(options->secret_key,       mpu->_secret_key,    sizeof(mpu->_secret_key));
     jbof_mpu_cursor_to_buf(options->session_token,    mpu->_session_token, sizeof(mpu->_session_token));
@@ -260,14 +367,33 @@ struct aws_s3_jbof_mpu *aws_s3_jbof_mpu_create(
     snprintf(host_port, sizeof(host_port), "%s:%u",
              mpu->_host, (unsigned)options->meta_server_port);
 
-    char req[2048];
+    /* mpu->_bucket (256) + mpu->_key (1024) are both bounded fixed buffers,
+     * so this can never truncate; sized with margin regardless. */
+    char path[1408];
+    snprintf(path, sizeof(path), "/%s/%s", mpu->_bucket, mpu->_key);
+    char sig_block[1536];
+    jbof_mpu_emit_sig_block(mpu, "POST", path, "uploads=", host_port,
+                            sig_block, sizeof(sig_block));
+
+    char req[3072];
     int reqlen = snprintf(req, sizeof(req),
         "POST /%s/%s?uploads HTTP/1.0\r\n"
         "Host: %s\r\n"
         "Content-Length: 0\r\n"
+        "%s"
         "\r\n",
         mpu->_bucket, mpu->_key,
-        host_port);
+        host_port,
+        sig_block);
+    /* snprintf() returns the length that *would* have been written; on
+     * truncation (n < 0 or n >= sizeof(req)) the subsequent send() below
+     * must not read n bytes from req — that would leak out-of-bounds stack
+     * memory onto the wire. Fail instead. */
+    if (reqlen < 0 || (size_t)reqlen >= sizeof(req)) {
+        aws_mem_release(allocator, mpu);
+        aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        return NULL;
+    }
 
     int fd = jbof_mpu_tcp_connect(mpu->_host, options->meta_server_port);
     if (fd < 0) {
@@ -303,11 +429,17 @@ struct aws_s3_jbof_mpu *aws_s3_jbof_mpu_create(
     }
     close(fd);
 
-    /* Try JSON "upload_id" field first, then X-Upload-ID header. */
+    /* Try JSON "upload_id" field first, then X-Upload-ID header, then fall
+     * back to a standard S3 InitiateMultipartUploadResult XML body
+     * (<UploadId>...</UploadId>) so a plain S3-compatible endpoint works
+     * too, not just the JBOF metadata server's native response shape. */
     jbof_mpu_parse_upload_id(body_buf, mpu->upload_id, sizeof(mpu->upload_id));
     if (!mpu->upload_id[0]) {
         jbof_mpu_header_value(hdr_buf, "X-Upload-ID",
                               mpu->upload_id, sizeof(mpu->upload_id));
+    }
+    if (!mpu->upload_id[0]) {
+        jbof_mpu_parse_upload_id_xml(body_buf, mpu->upload_id, sizeof(mpu->upload_id));
     }
     if (!mpu->upload_id[0]) {
         aws_mem_release(allocator, mpu);
@@ -373,13 +505,20 @@ int aws_s3_jbof_mpu_upload_part(
 
     part_result->part_number = part_number;
     part_result->etag[0]     = '\0';
-    if (put_result.etag) {
-        size_t elen = strlen(put_result.etag);
-        if (elen >= sizeof(part_result->etag))
-            elen = sizeof(part_result->etag) - 1;
-        memcpy(part_result->etag, put_result.etag, elen);
-        part_result->etag[elen] = '\0';
+    if (!put_result.etag || !put_result.etag[0]) {
+        /* A part commit with no ETag can't be referenced by
+         * CompleteMultipartUpload (it would emit an empty <ETag></ETag>,
+         * producing a corrupt request the server must reject or worse,
+         * silently accept as a "match-anything" part). Treat as failure. */
+        aws_s3_jbof_put_result_clean_up(mpu->allocator, &put_result);
+        return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
+
+    size_t elen = strlen(put_result.etag);
+    if (elen >= sizeof(part_result->etag))
+        elen = sizeof(part_result->etag) - 1;
+    memcpy(part_result->etag, put_result.etag, elen);
+    part_result->etag[elen] = '\0';
 
     aws_s3_jbof_put_result_clean_up(mpu->allocator, &put_result);
     return AWS_OP_SUCCESS;
@@ -396,44 +535,86 @@ int aws_s3_jbof_mpu_complete(
     if (!mpu || !part_results || part_count == 0 || !out_result) {
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
+    if (part_count > JBOF_MPU_MAX_PARTS) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
     memset(out_result, 0, sizeof(*out_result));
 
-    /* Build the CompleteMultipartUpload XML body. */
-    char *xml = aws_mem_calloc(mpu->allocator, 1, JBOF_MPU_XML_BUF);
+    /* Build the CompleteMultipartUpload XML body in a heap buffer sized
+     * from the actual part_count (see JBOF_MPU_XML_PART_MAX/WRAP_MAX above)
+     * instead of a fixed-size buffer that could not hold JBOF_MPU_MAX_PARTS
+     * parts with near-max-length ETags. Every append below checks the
+     * snprintf() return for truncation before trusting xml_off, since a
+     * truncated-but-unnoticed offset would both corrupt the XML and desync
+     * xml_off from the buffer's real contents. */
+    size_t xml_cap = (size_t)part_count * JBOF_MPU_XML_PART_MAX + JBOF_MPU_XML_WRAP_MAX;
+    char *xml = aws_mem_calloc(mpu->allocator, 1, xml_cap);
     if (!xml) return aws_raise_error(AWS_ERROR_OOM);
 
-    int xml_off = snprintf(xml, JBOF_MPU_XML_BUF,
-                           "<CompleteMultipartUpload>");
+    size_t xml_off = 0;
+    int n = snprintf(xml, xml_cap, "<CompleteMultipartUpload>");
+    if (n < 0 || (size_t)n >= xml_cap) {
+        aws_mem_release(mpu->allocator, xml);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+    xml_off = (size_t)n;
+
     for (size_t i = 0; i < part_count; i++) {
-        xml_off += snprintf(xml + xml_off, JBOF_MPU_XML_BUF - xml_off,
-                            "<Part>"
-                            "<PartNumber>%d</PartNumber>"
-                            "<ETag>%s</ETag>"
-                            "</Part>",
-                            part_results[i].part_number,
-                            part_results[i].etag);
-        if (xml_off >= JBOF_MPU_XML_BUF - 64) {
+        n = snprintf(xml + xml_off, xml_cap - xml_off,
+                    "<Part>"
+                    "<PartNumber>%d</PartNumber>"
+                    "<ETag>%s</ETag>"
+                    "</Part>",
+                    part_results[i].part_number,
+                    part_results[i].etag);
+        if (n < 0 || (size_t)n >= xml_cap - xml_off) {
             aws_mem_release(mpu->allocator, xml);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
+        xml_off += (size_t)n;
     }
-    xml_off += snprintf(xml + xml_off, JBOF_MPU_XML_BUF - xml_off,
-                        "</CompleteMultipartUpload>");
+
+    n = snprintf(xml + xml_off, xml_cap - xml_off, "</CompleteMultipartUpload>");
+    if (n < 0 || (size_t)n >= xml_cap - xml_off) {
+        aws_mem_release(mpu->allocator, xml);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+    xml_off += (size_t)n;
 
     char host_port[96];
     snprintf(host_port, sizeof(host_port), "%s:%u",
              mpu->_host, (unsigned)mpu->options.meta_server_port);
 
-    char req_hdr[1024];
+    /* mpu->_bucket (256) + mpu->_key (1024) are both bounded fixed buffers,
+     * so this can never truncate; sized with margin regardless. */
+    char path[1408];
+    snprintf(path, sizeof(path), "/%s/%s", mpu->_bucket, mpu->_key);
+    char query[300];
+    snprintf(query, sizeof(query), "uploadId=%s", mpu->upload_id);
+    char sig_block[1536];
+    jbof_mpu_emit_sig_block(mpu, "POST", path, query, host_port,
+                            sig_block, sizeof(sig_block));
+
+    char req_hdr[4096];
     int hdrlen = snprintf(req_hdr, sizeof(req_hdr),
         "POST /%s/%s?uploadId=%s HTTP/1.0\r\n"
         "Host: %s\r\n"
         "Content-Type: application/xml\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %zu\r\n"
+        "%s"
         "\r\n",
         mpu->_bucket, mpu->_key, mpu->upload_id,
         host_port,
-        xml_off);
+        xml_off,
+        sig_block);
+    /* Guard against snprintf() truncation before trusting hdrlen as a
+     * send() length — see the identical rationale in aws_s3_jbof_mpu_create
+     * above; sending a would-be (untruncated) length here would read past
+     * the end of req_hdr and leak stack memory onto the wire. */
+    if (hdrlen < 0 || (size_t)hdrlen >= sizeof(req_hdr)) {
+        aws_mem_release(mpu->allocator, xml);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
 
     int fd = jbof_mpu_tcp_connect(mpu->_host, mpu->options.meta_server_port);
     if (fd < 0) {
@@ -441,7 +622,7 @@ int aws_s3_jbof_mpu_complete(
         return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
     }
     if (jbof_mpu_send_all(fd, req_hdr, (size_t)hdrlen) < 0 ||
-        jbof_mpu_send_all(fd, xml, (size_t)xml_off) < 0) {
+        jbof_mpu_send_all(fd, xml, xml_off) < 0) {
         close(fd);
         aws_mem_release(mpu->allocator, xml);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
@@ -463,8 +644,8 @@ int aws_s3_jbof_mpu_complete(
     if (content_len > 0 && content_len < (int)sizeof(body_buf) - 1) {
         jbof_mpu_recv_body(fd, body_buf, content_len);
     } else {
-        int n = recv(fd, body_buf, sizeof(body_buf) - 1, 0);
-        body_buf[n > 0 ? n : 0] = '\0';
+        int rlen = recv(fd, body_buf, sizeof(body_buf) - 1, 0);
+        body_buf[rlen > 0 ? rlen : 0] = '\0';
     }
     close(fd);
 
@@ -498,22 +679,41 @@ void aws_s3_jbof_mpu_abort(struct aws_s3_jbof_mpu *mpu) {
     snprintf(host_port, sizeof(host_port), "%s:%u",
              mpu->_host, (unsigned)mpu->options.meta_server_port);
 
-    char req[1024];
+    /* mpu->_bucket (256) + mpu->_key (1024) are both bounded fixed buffers,
+     * so this can never truncate; sized with margin regardless. */
+    char path[1408];
+    snprintf(path, sizeof(path), "/%s/%s", mpu->_bucket, mpu->_key);
+    char query[300];
+    snprintf(query, sizeof(query), "uploadId=%s", mpu->upload_id);
+    char sig_block[1536];
+    jbof_mpu_emit_sig_block(mpu, "DELETE", path, query, host_port,
+                            sig_block, sizeof(sig_block));
+
+    char req[3072];
     int reqlen = snprintf(req, sizeof(req),
         "DELETE /%s/%s?uploadId=%s HTTP/1.0\r\n"
         "Host: %s\r\n"
         "Content-Length: 0\r\n"
+        "%s"
         "\r\n",
         mpu->_bucket, mpu->_key, mpu->upload_id,
-        host_port);
+        host_port,
+        sig_block);
 
-    int fd = jbof_mpu_tcp_connect(mpu->_host, mpu->options.meta_server_port);
-    if (fd >= 0) {
-        jbof_mpu_send_all(fd, req, (size_t)reqlen);
-        /* Drain response (best-effort). */
-        char tmp[4096];
-        recv(fd, tmp, sizeof(tmp) - 1, 0);
-        close(fd);
+    /* Guard against snprintf() truncation before trusting reqlen as a
+     * send() length (same OOB-read-onto-the-wire hazard as create()/
+     * complete()). Abort is already best-effort, so on truncation we just
+     * skip sending rather than aborting the whole cleanup path — the mpu
+     * handle must still be destroyed below either way. */
+    if (reqlen >= 0 && (size_t)reqlen < sizeof(req)) {
+        int fd = jbof_mpu_tcp_connect(mpu->_host, mpu->options.meta_server_port);
+        if (fd >= 0) {
+            jbof_mpu_send_all(fd, req, (size_t)reqlen);
+            /* Drain response (best-effort). */
+            char tmp[4096];
+            recv(fd, tmp, sizeof(tmp) - 1, 0);
+            close(fd);
+        }
     }
 
     aws_s3_jbof_mpu_destroy(mpu);

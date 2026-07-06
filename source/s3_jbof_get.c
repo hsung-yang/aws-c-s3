@@ -18,6 +18,7 @@
 #include <aws/s3/s3_jbof_get.h>
 
 #include <aws/common/byte_buf.h>
+#include <aws/common/encoding.h>
 #include <aws/common/error.h>
 #include <aws/common/json.h>
 #include <aws/common/string.h>
@@ -175,6 +176,64 @@ static void jbof_header_value(const char *hdr, const char *name,
         }
         p = eol + 2;
     }
+}
+
+/* True if the HTTP status line indicates a usable response: 200 always;
+ * 206 (Partial Content) or 204 (No Content) additionally accepted when the
+ * request carried a Range header (ranged != 0). Fix: the code used to
+ * reject 206 unconditionally, which breaks ranged GETs against a
+ * conforming metadata server. */
+static int jbof_status_ok(const char *hdr, int ranged) {
+    if (strstr(hdr, " 200 ")) return 1;
+    if (ranged && (strstr(hdr, " 206 ") || strstr(hdr, " 204 "))) return 1;
+    return 0;
+}
+
+/* True if the response's Content-Type (case-insensitive header name, per
+ * jbof_header_value) contains `token`, OR no Content-Type header is present
+ * at all (tolerated for compatibility with permissive mock servers that
+ * omit it — real conforming servers always send it). Returns 0 only when a
+ * Content-Type IS present and does NOT contain `token`. `token` itself is
+ * matched case-sensitively: the media-type string is lowercase by spec. */
+static int jbof_content_type_ok(const char *hdr, const char *token) {
+    char ctype[256];
+    jbof_header_value(hdr, "Content-Type", ctype, sizeof(ctype));
+    if (!ctype[0]) return 1;
+    return strstr(ctype, token) != NULL;
+}
+
+/* Percent-encode everything except unreserved chars [A-Za-z0-9-._~] and
+ * '/' (S3 keeps '/' unescaped inside object keys). Behaves like snprintf:
+ * always returns the full encoded length needed (even if it doesn't fit),
+ * and NUL-terminates whatever was written when `out_cap` is nonzero. The
+ * caller MUST check the return value against out_cap and treat `>= out_cap`
+ * as an error — this function never writes past out_cap and never emits a
+ * partial %XX escape, but a too-small buffer means the string was
+ * truncated. */
+static size_t jbof_get_uri_encode(const char *in, size_t in_len,
+                                  char *out, size_t out_cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t needed = 0;
+    size_t oi = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                         (c >= '0' && c <= '9') ||
+                         c == '-' || c == '.' || c == '_' || c == '~' || c == '/';
+        size_t unit = unreserved ? 1 : 3;
+        needed += unit;
+        if (out && out_cap && oi + unit < out_cap) {
+            if (unreserved) {
+                out[oi++] = (char)c;
+            } else {
+                out[oi++] = '%';
+                out[oi++] = hex[(c >> 4) & 0xF];
+                out[oi++] = hex[c & 0xF];
+            }
+        }
+    }
+    if (out && out_cap) out[(oi < out_cap) ? oi : out_cap - 1] = '\0';
+    return needed;
 }
 
 static char *jbof_dup_cstr_from_json(struct aws_allocator *alloc,
@@ -353,8 +412,44 @@ static int jbof_parse_extent(struct aws_allocator *alloc,
         ext_obj, aws_byte_cursor_from_c_str("checksum"));
     if (ck) {
         v = aws_json_value_get_from_object(ck, aws_byte_cursor_from_c_str("value"));
-        if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) {
-            out->expected_crc32c = (uint32_t)d;
+        if (v) {
+            /* RDMA_PROTOCOL_SPEC.md: checksum.value is a base64-encoded
+             * 4-byte CRC32C (S3 convention: big-endian byte order), not a
+             * JSON number. A conforming server sends a string; parsing it
+             * as a number silently failed and left expected_crc32c at 0,
+             * causing false CRC mismatches (or worse, unverified data if
+             * the actual CRC also happened to be 0). */
+            struct aws_byte_cursor b64;
+            if (aws_json_value_get_string(v, &b64) == AWS_OP_SUCCESS) {
+                size_t decoded_len = 0;
+                if (aws_base64_compute_decoded_len(&b64, &decoded_len) == AWS_OP_SUCCESS &&
+                    decoded_len == 4) {
+                    uint8_t decoded[4];
+                    struct aws_byte_buf decoded_buf =
+                        aws_byte_buf_from_empty_array(decoded, sizeof(decoded));
+                    if (aws_base64_decode(&b64, &decoded_buf) == AWS_OP_SUCCESS &&
+                        decoded_buf.len == 4) {
+                        out->expected_crc32c =
+                            ((uint32_t)decoded[0] << 24) | ((uint32_t)decoded[1] << 16) |
+                            ((uint32_t)decoded[2] << 8)  |  (uint32_t)decoded[3];
+                    }
+                }
+                /* decode failure or decoded_len != 4: leave expected_crc32c
+                 * at its memset(0) default. rp_extent_t (see
+                 * include/object_rdma/read_planner.h, a different vendored
+                 * library out of scope here) has no has_crc/crc_valid flag
+                 * for "this extent carried no expected checksum" — only
+                 * rp_read_work_t does, and that's set by the planner from
+                 * ranged-clipping, not from checksum presence. So this is
+                 * no worse than the pre-fix behavior (which also silently
+                 * left expected_crc32c at 0 whenever parsing failed); it's
+                 * a known gap, not something this file can close alone. */
+            } else if (aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) {
+                /* Fallback for non-conforming senders (e.g. some mock/test
+                 * servers) that still emit checksum.value as a JSON number.
+                 * The base64-string path above is preferred per spec. */
+                out->expected_crc32c = (uint32_t)d;
+            }
         }
     }
 
@@ -414,7 +509,7 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     int sock = jbof_tcp_connect(host_z, options->meta_server_port);
     if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
-    char req[2048];
+    char req[8192];
     char range_hdr[64] = "";
     if (options->req_range_length) {
         snprintf(range_hdr, sizeof(range_hdr),
@@ -424,13 +519,30 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
                                       + options->req_range_length - 1));
     }
 
+    /* Percent-encode bucket/key once; reused for both the SigV4 canonical
+     * URI and the literal request line below so the two can never diverge
+     * (a mismatch there breaks SigV4 signature verification server-side). */
+    char enc_bucket[256], enc_key[3200];
+    size_t enc_bucket_len = jbof_get_uri_encode(
+        (const char *)options->bucket.ptr, options->bucket.len,
+        enc_bucket, sizeof(enc_bucket));
+    size_t enc_key_len = jbof_get_uri_encode(
+        (const char *)options->key.ptr, options->key.len,
+        enc_key, sizeof(enc_key));
+    if (enc_bucket_len >= sizeof(enc_bucket) || enc_key_len >= sizeof(enc_key)) {
+        close(sock);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+    char path[sizeof(enc_bucket) + sizeof(enc_key) + 4];
+    int path_len = snprintf(path, sizeof(path), "/%s/%s", enc_bucket, enc_key);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+        close(sock);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+
     /* Optional SigV4 signing. */
     char sig_block[1536] = "";
     if (options->access_key.len && options->secret_key.len) {
-        char path[512];
-        snprintf(path, sizeof(path), "/%.*s/%.*s",
-                 (int)options->bucket.len, options->bucket.ptr,
-                 (int)options->key.len,    options->key.ptr);
         char host_port[96];
         snprintf(host_port, sizeof(host_port), "%s:%u",
                  host_z, (unsigned)options->meta_server_port);
@@ -447,7 +559,9 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
                 "X-Amz-Content-SHA256: %s\r\n"
                 "Authorization: %s\r\n",
                 sv.amz_date, sv.content_sha256, sv.authorization);
-            if (options->session_token.len) {
+            if (sn < 0) sn = 0;
+            if ((size_t)sn >= sizeof(sig_block)) sn = (int)sizeof(sig_block) - 1;
+            if (options->session_token.len && (size_t)sn < sizeof(sig_block)) {
                 char st[1024];
                 jbof_cur_to_cstr(options->session_token, st, sizeof(st));
                 snprintf(sig_block + sn, sizeof(sig_block) - sn,
@@ -457,15 +571,18 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     }
 
     int  reqlen = snprintf(req, sizeof(req),
-        "GET /%.*s/%.*s HTTP/1.0\r\n"
+        "GET %s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "Accept: application/vnd.s3rdma.layout+json\r\n"
         "%s%s"
         "\r\n",
-        (int)options->bucket.len, options->bucket.ptr,
-        (int)options->key.len,    options->key.ptr,
+        path,
         host_z, (unsigned)options->meta_server_port,
         range_hdr, sig_block);
+    if (reqlen < 0 || (size_t)reqlen >= sizeof(req)) {
+        close(sock);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
     if (jbof_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
@@ -473,7 +590,7 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
 
     char hdr_buf[JBOF_HTTP_HDR_BUF];
     int  hdrlen = jbof_recv_headers(sock, hdr_buf, sizeof(hdr_buf));
-    if (hdrlen < 12 || !strstr(hdr_buf, " 200 ")) {
+    if (hdrlen < 12 || !jbof_status_ok(hdr_buf, options->req_range_length != 0)) {
         close(sock);
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
@@ -516,6 +633,15 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
             out_result->elapsed_seconds = 0.0;
             return AWS_OP_SUCCESS;
         }
+    }
+
+    /* Body is not a decline payload past this point — it must be layout
+     * JSON. Reject anything whose Content-Type says otherwise; tolerate an
+     * absent Content-Type header for mock-server compat (see
+     * jbof_content_type_ok). */
+    if (!jbof_content_type_ok(hdr_buf, "application/vnd.s3rdma.layout+json")) {
+        aws_mem_release(allocator, body);
+        return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
 
     /* ── 1b. Pull headers we care about for the layout/lease cycle ───── */
@@ -587,7 +713,18 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
             aws_mem_release(allocator, body);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
-        size_t end = (size_t)rex[i].object_offset + (size_t)rex[i].length;
+        /* object_offset/length are server-controlled; object_offset near
+         * SIZE_MAX would wrap the addition and under-count total_bytes,
+         * defeating the gpu_buffer_capacity check below. Reject instead. */
+        size_t off = (size_t)rex[i].object_offset;
+        size_t len = (size_t)rex[i].length;
+        size_t end = off + len;
+        if (end < off) {
+            aws_mem_release(allocator, rex);
+            aws_json_value_destroy(root);
+            aws_mem_release(allocator, body);
+            return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
+        }
         if (end > total_bytes) total_bytes = end;
     }
 
@@ -666,7 +803,16 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
         .open_target      = jbof_open_target,
         .open_target_user = &map,
         .skip_crc         = options->verify_crc ? 0 : 1,
-        .async_crc        = options->verify_crc && options->async_crc ? 1 : 0,
+        /* A6/UAF: when async_crc is on, rp_execute submits the CRC kernel
+         * and returns before it finishes; the caller (below) then frees
+         * `bounce` right after rp_execute returns. With a bounce buffer in
+         * play, that free can race a still-running CRC step that reads
+         * `bounce`. rp_finish_crc has no hook to defer that free (the
+         * bounce lifetime is owned entirely by this file, not by
+         * libobject_rdma), so the safe fix is to force synchronous CRC
+         * whenever a bounce buffer is used — async_crc is only ever an
+         * optimization, never a correctness requirement. */
+        .async_crc        = need_bounce ? 0 : (options->verify_crc && options->async_crc ? 1 : 0),
         .use_o_direct     = options->use_o_direct,
     };
     /* Heap-allocate the planner buffer so it can outlive this stack frame
@@ -724,7 +870,8 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
                     "Host: %s:%u\r\n"
                     "\r\n",
                     lease_token, host_z, (unsigned)options->meta_server_port);
-                if (rl > 0) (void)jbof_send_all(rsock, rreq, (size_t)rl);
+                if (rl > 0 && (size_t)rl < sizeof(rreq))
+                    (void)jbof_send_all(rsock, rreq, (size_t)rl);
                 char tmp[256];
                 (void)jbof_recv_headers(rsock, tmp, sizeof(tmp));
                 close(rsock);
@@ -761,7 +908,8 @@ int aws_s3_jbof_get_finish_crc(struct aws_s3_jbof_get_result *result) {
                 "DELETE /v1/lease/%s HTTP/1.0\r\n"
                 "Host: %s:%u\r\n\r\n",
                 lc->token, lc->host, (unsigned)lc->port);
-            if (rl > 0) (void)jbof_send_all(rsock, rreq, (size_t)rl);
+            if (rl > 0 && (size_t)rl < sizeof(rreq))
+                (void)jbof_send_all(rsock, rreq, (size_t)rl);
             char tmp[256];
             (void)jbof_recv_headers(rsock, tmp, sizeof(tmp));
             close(rsock);
@@ -1041,20 +1189,47 @@ static int jbof_fetch_layout(struct aws_allocator *allocator,
                              const char *host_z, uint16_t port,
                              struct aws_byte_cursor bucket,
                              struct aws_byte_cursor key,
+                             uint64_t range_offset, uint64_t range_length,
                              const struct aws_s3_jbof_client *signing_client,
                              char *lease_token_out, size_t lease_token_cap,
                              struct jbof_cache_entry **out_entry) {
     *out_entry = NULL;
     if (lease_token_out && lease_token_cap) lease_token_out[0] = '\0';
 
+    /* Percent-encode bucket/key once; reused for both the SigV4 canonical
+     * URI and the literal request line below (must never diverge — see the
+     * matching comment in aws_s3_jbof_get_object). */
+    char enc_bucket[256], enc_key[3200];
+    size_t enc_bucket_len = jbof_get_uri_encode(
+        (const char *)bucket.ptr, bucket.len, enc_bucket, sizeof(enc_bucket));
+    size_t enc_key_len = jbof_get_uri_encode(
+        (const char *)key.ptr, key.len, enc_key, sizeof(enc_key));
+    if (enc_bucket_len >= sizeof(enc_bucket) || enc_key_len >= sizeof(enc_key)) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+    char path[sizeof(enc_bucket) + sizeof(enc_key) + 4];
+    int path_len = snprintf(path, sizeof(path), "/%s/%s", enc_bucket, enc_key);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+
     int sock = jbof_tcp_connect(host_z, port);
     if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
 
+    /* Fix (ranged cached GET): this request previously never carried a
+     * Range header, yet the caller validates the returned layout's summed
+     * length against range_length — which only works if the metadata
+     * server independently guesses the range. Send it explicitly. */
+    char range_hdr[64] = "";
+    if (range_length) {
+        snprintf(range_hdr, sizeof(range_hdr),
+                 "Range: bytes=%llu-%llu\r\n",
+                 (unsigned long long)range_offset,
+                 (unsigned long long)(range_offset + range_length - 1));
+    }
+
     char sig_block[1536] = "";
     if (signing_client && signing_client->signing_enabled) {
-        char path[512];
-        snprintf(path, sizeof(path), "/%.*s/%.*s",
-                 (int)bucket.len, bucket.ptr, (int)key.len, key.ptr);
         char host_port[96];
         snprintf(host_port, sizeof(host_port), "%s:%u", host_z, (unsigned)port);
         struct aws_s3_jbof_sigv4_input in = {
@@ -1073,7 +1248,9 @@ static int jbof_fetch_layout(struct aws_allocator *allocator,
                 "X-Amz-Content-SHA256: %s\r\n"
                 "Authorization: %s\r\n",
                 sv.amz_date, sv.content_sha256, sv.authorization);
-            if (signing_client->session_token[0]) {
+            if (sn < 0) sn = 0;
+            if ((size_t)sn >= sizeof(sig_block)) sn = (int)sizeof(sig_block) - 1;
+            if (signing_client->session_token[0] && (size_t)sn < sizeof(sig_block)) {
                 snprintf(sig_block + sn, sizeof(sig_block) - sn,
                          "X-Amz-Security-Token: %s\r\n",
                          signing_client->session_token);
@@ -1081,25 +1258,54 @@ static int jbof_fetch_layout(struct aws_allocator *allocator,
         }
     }
 
-    char req[2048];
+    char req[8192];
     int reqlen = snprintf(req, sizeof(req),
-        "GET /%.*s/%.*s HTTP/1.0\r\n"
+        "GET %s HTTP/1.0\r\n"
         "Host: %s:%u\r\n"
         "Accept: application/vnd.s3rdma.layout+json\r\n"
-        "%s"
+        "%s%s"
         "\r\n",
-        (int)bucket.len, bucket.ptr, (int)key.len, key.ptr,
-        host_z, (unsigned)port, sig_block);
+        path,
+        host_z, (unsigned)port, range_hdr, sig_block);
+    if (reqlen < 0 || (size_t)reqlen >= sizeof(req)) {
+        close(sock);
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
     if (jbof_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
     }
     char hdr_buf[JBOF_HTTP_HDR_BUF];
     int hdrlen = jbof_recv_headers(sock, hdr_buf, sizeof(hdr_buf));
-    if (hdrlen < 12 || !strstr(hdr_buf, " 200 ")) {
+    if (hdrlen < 12 || !jbof_status_ok(hdr_buf, range_length != 0)) {
         close(sock);
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
+
+    /* A6/fallback: detect RDMA decline (spec §4.3). Unlike the standalone
+     * aws_s3_jbof_get_object (§1a there), this cached-client path has no
+     * HTTP-body downloader: a decline's body is raw object bytes, not
+     * layout JSON, and jbof_cache_entry only knows how to store a parsed
+     * layout. Fail clearly rather than feeding object bytes to the JSON
+     * parser below (which would misparse or silently produce garbage).
+     * TODO(A6/fallback): to support this path, have jbof_fetch_layout
+     * return the raw body plus a "this is data, not layout" flag, and
+     * teach aws_s3_jbof_client_get_object to copy it into gpu_buffer the
+     * same way aws_s3_jbof_get_object's §1a branch does. */
+    {
+        char reply[16];
+        jbof_header_value(hdr_buf, "x-amz-rdma-reply", reply, sizeof(reply));
+        if (reply[0] == '5' && reply[1] == '0' && reply[2] == '1') {
+            close(sock);
+            return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
+        }
+    }
+
+    if (!jbof_content_type_ok(hdr_buf, "application/vnd.s3rdma.layout+json")) {
+        close(sock);
+        return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
+    }
+
     const char *cl = strstr(hdr_buf, "Content-Length:");
     int content_len = cl ? atoi(cl + 15) : 0;
     if (content_len <= 0) {
@@ -1246,6 +1452,7 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
         struct jbof_cache_entry *fresh = NULL;
         if (jbof_fetch_layout(alloc, client->meta_host, client->meta_port,
                               options->bucket, options->key,
+                              options->req_range_offset, options->req_range_length,
                               client,
                               lease_token, sizeof(lease_token),
                               &fresh) != AWS_OP_SUCCESS) {
@@ -1309,9 +1516,32 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     if (options->req_range_length) {
         total_bytes = (size_t)options->req_range_length;
     } else {
+        /* MAX(object_offset + length) across extents, NOT sum of lengths.
+         * The planner writes each extent at plan_dst + object_offset
+         * (rp_plan_build_ranged), so a layout with gaps or reordered
+         * extents makes sum(length) undercount the highest byte actually
+         * written — that undercount let rp_execute write past
+         * gpu_buffer/bounce. Mirrors the overflow-checked computation in
+         * the standalone path (aws_s3_jbof_get_object). */
         total_bytes = 0;
-        for (size_t i = 0; i < local_n; i++)
-            total_bytes += (size_t)local_extents[i].length;
+        for (size_t i = 0; i < local_n; i++) {
+            size_t off = (size_t)local_extents[i].object_offset;
+            size_t len = (size_t)local_extents[i].length;
+            size_t end = off + len;
+            if (end < off) {   /* overflow: server-controlled object_offset */
+                aws_mem_release(alloc, local_extents);
+                return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
+            }
+            if (end > total_bytes) total_bytes = end;
+        }
+    }
+
+    /* Capacity check BEFORE any pread/execute — and before sizing the
+     * bounce buffer below, which is later memcpy'd straight into
+     * gpu_buffer at this same size. */
+    if (total_bytes > options->gpu_buffer_capacity) {
+        aws_mem_release(alloc, local_extents);
+        return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
 
     int need_bounce = options->use_bounce_buffer || (getenv("SHFT_BOUNCE") != NULL);
@@ -1337,11 +1567,6 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     if (rc != RP_OK) {
         if (bounce) free(bounce);
         return jbof_raise_for_planner_rc(rc);
-    }
-    if (total_bytes > options->gpu_buffer_capacity) {
-        free(work);
-        if (bounce) free(bounce);
-        return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
 
     int workers = options->workers_per_target > 0 ? options->workers_per_target : 1;
@@ -1410,7 +1635,8 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
                 "DELETE /v1/lease/%s HTTP/1.0\r\n"
                 "Host: %s:%u\r\n\r\n",
                 lease_token, client->meta_host, (unsigned)client->meta_port);
-            if (rl > 0) (void)jbof_send_all(rsock, rreq, (size_t)rl);
+            if (rl > 0 && (size_t)rl < sizeof(rreq))
+                (void)jbof_send_all(rsock, rreq, (size_t)rl);
             char tmp[256];
             (void)jbof_recv_headers(rsock, tmp, sizeof(tmp));
             close(rsock);

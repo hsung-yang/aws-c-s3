@@ -28,11 +28,14 @@
 #include "aws/s3/private/s3_request_messages.h"
 #include "aws/s3/private/s3_util.h"
 #include <aws/common/error.h>
+#include <aws/http/http.h>
 #include <aws/http/request_response.h>
+#include <aws/io/io.h>
 #include <aws/s3/s3.h>
 #include <aws/s3/s3_jbof_get.h>
 #include <aws/s3/s3_jbof_put.h>
 
+#include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,8 +51,26 @@ struct aws_s3_meta_request_jbof {
     /* D2: copied from extra->disable_rdma_on_retry at construction time. */
     int                                    disable_rdma_on_retry;
 
-    /* Written by background pthread; read by finished_request. */
-    int completion_error_code;
+    /* Written by background pthread; read by finished_request.
+     *
+     * op_has_run distinguishes "the blocking JBOF op (GET read+CRC, or PUT
+     * write+commit) actually executed at least once, and completion_error_code
+     * holds its result" from "prepare_request's worker thread never got to run
+     * it" (e.g. pthread_create failed) -- completion_error_code's zero-initialized
+     * default is numerically equal to AWS_ERROR_SUCCESS, so it cannot serve as
+     * its own "did it run" sentinel.
+     *
+     * It doubles as the single-shot guard: the framework may re-invoke
+     * prepare_request (and thus spawn a new worker thread) on the same
+     * meta-request if the synthetic probe HTTP request that follows the JBOF
+     * op is retried (see aws_s3_client_notify_connection_finished's
+     * AWS_S3_CONNECTION_FINISH_CODE_RETRY path -> s_s3_client_retry_ready ->
+     * aws_s3_meta_request_prepare_request, all in s3_client.c, called on the
+     * SAME struct aws_s3_request*). Once op_has_run is true, a subsequent
+     * worker-thread invocation must NOT re-run the destructive GET/PUT --
+     * doing so would double-commit a PUT or double-execute a GET. */
+    bool op_has_run;
+    int  completion_error_code;
 
     struct {
         uint32_t request_sent      : 1;
@@ -102,19 +123,52 @@ static void s_parse_host_port(
     uint16_t *out_port,
     uint16_t default_port) {
 
-    /* Find last ':' in hdr; everything before is host, after is port. */
     const char *ptr = (const char *)hdr.ptr;
     size_t len = hdr.len;
+
+    /* Bracketed form: "[host]" or "[host]:port" -- required by RFC 3986 for
+     * IPv6 literals precisely so the port-separating ':' is unambiguous.
+     * Splitting on the LAST ':' (the old logic) mangles "[::1]:8080" by
+     * cutting the host in the middle of the address. */
+    if (len > 0 && ptr[0] == '[') {
+        const char *close = memchr(ptr, ']', len);
+        if (close != NULL) {
+            size_t hlen = (size_t)(close - ptr) - 1; /* exclude '[' */
+            size_t copy = hlen < host_buf_len - 1 ? hlen : host_buf_len - 1;
+            memcpy(host_buf, ptr + 1, copy);
+            host_buf[copy] = '\0';
+
+            const char *after = close + 1;
+            size_t after_len = len - (size_t)(after - ptr);
+            if (after_len > 0 && after[0] == ':') {
+                char pbuf[8];
+                size_t plen = after_len - 1;
+                if (plen >= sizeof(pbuf)) plen = sizeof(pbuf) - 1;
+                memcpy(pbuf, after + 1, plen);
+                pbuf[plen] = '\0';
+                *out_port = (uint16_t)atoi(pbuf);
+                if (*out_port == 0) *out_port = default_port;
+            } else {
+                *out_port = default_port;
+            }
+            return;
+        }
+        /* Malformed "[..." with no closing ']': fall through and treat the
+         * whole thing as an opaque host below (better than misparsing it). */
+    }
+
+    /* Not bracketed. Count colons: a bare (bracketless) IPv6 literal, e.g.
+     * "::1" or "fe80::1", has 2+ colons and no way to safely tell host from
+     * port apart -- treat the whole string as the host with the default
+     * port rather than guessing. Only split on ':' when there is exactly
+     * one, which unambiguously means "host:port" (IPv4 or hostname). */
+    size_t colon_count = 0;
     const char *colon = NULL;
     for (size_t i = 0; i < len; i++) {
-        if (ptr[i] == ':') colon = ptr + i;
+        if (ptr[i] == ':') { colon_count++; colon = ptr + i; }
     }
-    if (colon == NULL) {
-        size_t copy = len < host_buf_len - 1 ? len : host_buf_len - 1;
-        memcpy(host_buf, ptr, copy);
-        host_buf[copy] = '\0';
-        *out_port = default_port;
-    } else {
+
+    if (colon_count == 1) {
         size_t hlen = (size_t)(colon - ptr);
         size_t copy = hlen < host_buf_len - 1 ? hlen : host_buf_len - 1;
         memcpy(host_buf, ptr, copy);
@@ -126,12 +180,51 @@ static void s_parse_host_port(
         pbuf[plen] = '\0';
         *out_port = (uint16_t)atoi(pbuf);
         if (*out_port == 0) *out_port = default_port;
+    } else {
+        /* Zero colons (plain hostname/IPv4 with no port), or 2+ colons
+         * (bracketless IPv6 literal, no reliable port separator): keep the
+         * whole string as host. */
+        size_t copy = len < host_buf_len - 1 ? len : host_buf_len - 1;
+        memcpy(host_buf, ptr, copy);
+        host_buf[copy] = '\0';
+        *out_port = default_port;
     }
+}
+
+/* ── helper: bounded percent-decode ─────────────────────────────────── */
+
+/* Decodes %XX escapes in `in` (in_len bytes) into `out` (out_len capacity,
+ * NUL-terminated). '+' is left literal -- S3 keys are path segments, not
+ * form-encoded query values. Returns AWS_OP_SUCCESS, or AWS_OP_ERR (with
+ * AWS_ERROR_INVALID_ARGUMENT raised) if the decoded key would not fit --
+ * callers must not silently truncate, since that addresses the wrong
+ * object. */
+static int s_url_decode(const char *in, size_t in_len, char *out, size_t out_len) {
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        char c = in[i];
+        if (c == '%' && i + 2 < in_len &&
+            isxdigit((unsigned char)in[i + 1]) && isxdigit((unsigned char)in[i + 2])) {
+            char hex[3] = { in[i + 1], in[i + 2], '\0' };
+            c = (char)strtol(hex, NULL, 16);
+            i += 2;
+        }
+        if (o >= out_len - 1) {
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    return AWS_OP_SUCCESS;
 }
 
 /* ── helper: parse "/bucket/key" path ───────────────────────────────── */
 
-static void s_parse_path(
+/* Returns AWS_OP_SUCCESS, or raises AWS_ERROR_INVALID_ARGUMENT and returns
+ * AWS_OP_ERR if the bucket name or the (decoded) object key does not fit in
+ * the supplied buffers. A truncated key would silently address the WRONG
+ * object, so this must fail the meta-request rather than truncate. */
+static int s_parse_path(
     struct aws_byte_cursor path,
     char *bucket_buf, size_t bucket_len,
     char *key_buf,    size_t key_len) {
@@ -142,26 +235,39 @@ static void s_parse_path(
     /* skip leading '/' */
     if (n > 0 && p[0] == '/') { p++; n--; }
 
+    /* Strip the query string, if any -- it is not part of the object key. */
+    const char *qmark = memchr(p, '?', n);
+    if (qmark != NULL) {
+        n = (size_t)(qmark - p);
+    }
+
     /* find next '/' to split bucket from key */
     const char *slash = memchr(p, '/', n);
     if (!slash) {
         /* no key */
-        size_t blen = n < bucket_len - 1 ? n : bucket_len - 1;
-        memcpy(bucket_buf, p, blen);
-        bucket_buf[blen] = '\0';
+        if (n >= bucket_len) {
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        memcpy(bucket_buf, p, n);
+        bucket_buf[n] = '\0';
         key_buf[0] = '\0';
-    } else {
-        size_t blen = (size_t)(slash - p);
-        if (blen >= bucket_len) blen = bucket_len - 1;
-        memcpy(bucket_buf, p, blen);
-        bucket_buf[blen] = '\0';
-
-        const char *kp = slash + 1;
-        size_t klen = n - (size_t)(kp - p);
-        if (klen >= key_len) klen = key_len - 1;
-        memcpy(key_buf, kp, klen);
-        key_buf[klen] = '\0';
+        return AWS_OP_SUCCESS;
     }
+
+    size_t blen = (size_t)(slash - p);
+    if (blen >= bucket_len) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+    memcpy(bucket_buf, p, blen);
+    bucket_buf[blen] = '\0';
+
+    const char *kp = slash + 1;
+    size_t klen = n - (size_t)(kp - p);
+    if (s_url_decode(kp, klen, key_buf, key_len) != AWS_OP_SUCCESS) {
+        return AWS_OP_ERR;
+    }
+
+    return AWS_OP_SUCCESS;
 }
 
 /* ── constructor ─────────────────────────────────────────────────────── */
@@ -302,6 +408,15 @@ static void *s_jbof_worker_thread(void *arg) {
     struct aws_s3_meta_request *meta_request = &jbof->base;
     struct aws_s3_jbof_meta_request_extra *extra = jbof->extra;
 
+    /* Single-shot guard (see op_has_run's doc comment on the struct):
+     * capture whether the blocking op already ran in a PRIOR invocation of
+     * this worker before unconditionally marking that an attempt is now
+     * underway. `already_ran` gates the destructive GET/PUT call below;
+     * op_has_run itself tells finished_request that completion_error_code
+     * is meaningful (as opposed to its zero-initialized default). */
+    bool already_ran = jbof->op_has_run;
+    jbof->op_has_run = true;
+
     char host_buf[128]   = "127.0.0.1";
     char bucket_buf[256] = "";
     char key_buf[512]    = "";
@@ -315,7 +430,14 @@ static void *s_jbof_worker_thread(void *arg) {
         jbof->completion_error_code = aws_last_error_or_unknown();
         goto done;
     }
-    s_parse_path(path, bucket_buf, sizeof(bucket_buf), key_buf, sizeof(key_buf));
+    if (s_parse_path(path, bucket_buf, sizeof(bucket_buf), key_buf, sizeof(key_buf))
+        != AWS_OP_SUCCESS) {
+        /* Bucket or object key does not fit in the fixed-size buffers.
+         * Fail outright rather than silently truncate -- a truncated key
+         * would address the wrong object. */
+        jbof->completion_error_code = AWS_ERROR_INVALID_ARGUMENT;
+        goto done;
+    }
 
     /* Extract host header. */
     {
@@ -329,6 +451,22 @@ static void *s_jbof_worker_thread(void *arg) {
             goto done;
         }
         s_parse_host_port(host_hdr, host_buf, sizeof(host_buf), &port, 8080);
+    }
+
+    if (already_ran) {
+        /* The destructive GET/PUT already executed in a prior invocation of
+         * this worker (the framework retried the synthetic probe HTTP
+         * request built at `done:` below, which re-invoked prepare_request
+         * on the same aws_s3_request). completion_error_code already holds
+         * that prior result -- do not re-run the op (would double-commit a
+         * PUT or double-execute a GET) and do not re-touch
+         * extra->result_out / extra->put_result_ptr. */
+        AWS_LOGF_DEBUG(
+            AWS_LS_S3_META_REQUEST,
+            "id=%p JBOF op already executed once (result %d); skipping re-run on probe retry",
+            (void *)meta_request,
+            jbof->completion_error_code);
+        goto done;
     }
 
     if (!jbof->is_put) {
@@ -484,6 +622,24 @@ static struct aws_future_void *s_jbof_prepare_request(struct aws_s3_request *req
 
 /* ── finished_request ────────────────────────────────────────────────── */
 
+/* D2 whitelist: only these error codes indicate that the RDMA/JBOF data
+ * path itself is unavailable (transport/connection/thread-setup failure),
+ * meaning a caller-visible "fall back to plain HTTP" signal is appropriate.
+ * Deliberately excludes data-integrity errors (CRC mismatch), argument
+ * errors, and OOM -- those indicate a real defect or a real failed
+ * operation and must be reported as themselves, never masked as
+ * "unimplemented" (which could trigger a fallback that hides the bug). */
+static bool s_is_rdma_fallback_worthy_error(int error_code) {
+    switch (error_code) {
+        case AWS_IO_SOCKET_NOT_CONNECTED:
+        case AWS_ERROR_HTTP_CONNECTION_CLOSED:
+        case AWS_ERROR_THREAD_INVALID_SETTINGS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void s_jbof_finished_request(
     struct aws_s3_meta_request *meta_request,
     struct aws_s3_request *request,
@@ -493,16 +649,36 @@ static void s_jbof_finished_request(
     struct aws_s3_meta_request_jbof *jbof = meta_request->impl;
     (void)request;
 
-    /* JBOF helper result is authoritative.
-     * The probe HTTP request may fail (e.g. socket closed by mock server) even
-     * when the JBOF operation succeeded — treat that as success.
-     * Only if the JBOF helper itself succeeded but the framework signaled an
-     * infrastructure failure (e.g. pthread_create) do we keep the HTTP error. */
-    int final_code = jbof->completion_error_code;
+    /* JBOF helper result is authoritative -- but only if it actually ran.
+     * completion_error_code's zero-initialized default is numerically equal
+     * to AWS_ERROR_SUCCESS, indistinguishable from a real success, so guard
+     * on op_has_run: if the worker thread never got to run (e.g.
+     * prepare_request's pthread_create failed), use the framework's
+     * error_code directly instead of misreporting success.
+     *
+     * When the op did run: the probe HTTP request may fail (e.g. socket
+     * closed by mock server) even when the JBOF operation succeeded --
+     * treat that as success. Only if the JBOF helper itself succeeded but
+     * the framework signaled an infrastructure failure do we keep the HTTP
+     * error. */
+    int final_code;
+    if (!jbof->op_has_run) {
+        AWS_LOGF_DEBUG(
+            AWS_LS_S3_META_REQUEST,
+            "id=%p JBOF op never ran (prepare_request infra failure); using framework error %d",
+            (void *)meta_request, error_code);
+        final_code = (error_code != AWS_ERROR_SUCCESS) ? error_code : AWS_ERROR_UNKNOWN;
+    } else {
+        final_code = jbof->completion_error_code;
+    }
 
-    /* D2: if disable_rdma_on_retry is set and RDMA failed, log and signal
-     * the caller to use the HTTP fallback path instead of retrying RDMA. */
-    if (final_code != AWS_ERROR_SUCCESS && jbof->disable_rdma_on_retry) {
+    /* D2: if disable_rdma_on_retry is set and the JBOF op hit a genuinely
+     * fallback-worthy error, remap it to AWS_ERROR_UNIMPLEMENTED so the
+     * caller falls back to the plain HTTP path instead of retrying RDMA.
+     * Gated on op_has_run: this signal is about the RDMA data path itself,
+     * not generic framework infra failures. */
+    if (jbof->op_has_run && final_code != AWS_ERROR_SUCCESS &&
+        jbof->disable_rdma_on_retry && s_is_rdma_fallback_worthy_error(final_code)) {
         fprintf(stderr, "[s3_jbof] RDMA failed, falling back to HTTP\n");
         jbof->completion_error_code = AWS_ERROR_UNIMPLEMENTED;
         final_code                  = AWS_ERROR_UNIMPLEMENTED;

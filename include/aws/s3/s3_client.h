@@ -99,6 +99,20 @@ enum aws_s3_meta_request_type {
     AWS_S3_META_REQUEST_TYPE_JBOF_PUT,
 #endif /* AWS_ENABLE_JBOF */
 
+    /*
+     * ABI note: AWS_S3_META_REQUEST_TYPE_MAX's numeric value depends on
+     * whether AWS_ENABLE_JBOF was defined when this header was processed
+     * (it is 2 higher when JBOF is enabled, since the two JBOF_* values
+     * above are appended just before it). The JBOF values are additive at
+     * the END of the enum, so they never renumber DEFAULT / GET_OBJECT /
+     * PUT_OBJECT / COPY_OBJECT -- existing callers compiled without
+     * AWS_ENABLE_JBOF keep seeing the same values for those. But any
+     * component that references MAX itself (e.g. sizing a per-type array)
+     * MUST be compiled with the same AWS_ENABLE_JBOF setting as the rest of
+     * the link, or it will see a different MAX than the library actually
+     * uses. AWS_ENABLE_JBOF must be defined identically for every
+     * translation unit and consumer linked into a given binary.
+     */
     AWS_S3_META_REQUEST_TYPE_MAX,
 };
 
