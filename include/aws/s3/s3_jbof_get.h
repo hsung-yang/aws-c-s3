@@ -35,6 +35,16 @@ struct aws_s3_jbof_target_device {
     struct aws_byte_cursor device_path;   /* e.g. "/dev/nvme1n1" */
 };
 
+/* SPDK bypass target — one per RDMA leg. When spdk_targets is non-NULL in
+ * aws_s3_jbof_get_options, the helper uses SPDK userspace NVMe-oF instead
+ * of kernel pread. Requires -DWITH_SPDK_BYPASS=ON at build time. */
+struct aws_s3_jbof_spdk_target {
+    struct aws_byte_cursor traddr;    /* e.g. "172.52.8.30" */
+    uint16_t               trsvcid;   /* e.g. 4420 */
+    struct aws_byte_cursor subnqn;    /* e.g. "nqn.2024-01.io.example:jbof-ns0" */
+    struct aws_byte_cursor hostaddr;  /* source IP for 2nd leg, empty for 1st */
+};
+
 struct aws_s3_jbof_client_options {
     /* Metadata server endpoint (used by every GET on this client). */
     struct aws_byte_cursor meta_server_host;
@@ -115,6 +125,9 @@ struct aws_s3_jbof_get_options {
      * Required on soft-RoCE hosts where ibv_reg_mr cannot register CUDA
      * memory. Set automatically if SHFT_BOUNCE=1 env var is detected. */
     int                                     use_bounce_buffer;
+
+    const struct aws_s3_jbof_spdk_target   *spdk_targets;
+    size_t                                  spdk_target_count;
 
     /* SigV4 credentials for this single call (only consulted by the
      * standalone aws_s3_jbof_get_object; the cached client carries its

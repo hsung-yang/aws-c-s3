@@ -28,6 +28,9 @@
 #include <aws/s3/s3_jbof_sigv4.h>
 
 #include "object_rdma/read_planner.h"
+#ifdef WITH_SPDK_BYPASS
+#include "object_rdma/spdk_bypass.h"
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -827,7 +830,47 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     pbuf->length = total_bytes;
 
     double t0 = jbof_now_sec();
-    int prc = rp_execute(work, n_work, pbuf, &pcfg);
+    int prc;
+#ifdef WITH_SPDK_BYPASS
+    if (options->spdk_targets && options->spdk_target_count > 0) {
+        rp_spdk_target_t *spdk_tgts = calloc(options->spdk_target_count,
+                                              sizeof(*spdk_tgts));
+        if (!spdk_tgts) {
+            free(work);
+            if (bounce) free(bounce);
+            aws_mem_release(allocator, pbuf);
+            return aws_raise_error(AWS_ERROR_OOM);
+        }
+        for (size_t i = 0; i < options->spdk_target_count; i++) {
+            const struct aws_s3_jbof_spdk_target *st = &options->spdk_targets[i];
+            snprintf(spdk_tgts[i].traddr, sizeof(spdk_tgts[i].traddr), "%.*s",
+                     (int)st->traddr.len, st->traddr.ptr);
+            spdk_tgts[i].trsvcid = st->trsvcid;
+            snprintf(spdk_tgts[i].subnqn, sizeof(spdk_tgts[i].subnqn), "%.*s",
+                     (int)st->subnqn.len, st->subnqn.ptr);
+            if (st->hostaddr.len > 0) {
+                snprintf(spdk_tgts[i].hostaddr, sizeof(spdk_tgts[i].hostaddr),
+                         "%.*s", (int)st->hostaddr.len, st->hostaddr.ptr);
+            }
+        }
+        rp_spdk_session_t *spdk_sess = rp_spdk_session_create(spdk_tgts,
+            (int)options->spdk_target_count, 1);
+        free(spdk_tgts);
+        if (!spdk_sess) {
+            free(work);
+            if (bounce) free(bounce);
+            aws_mem_release(allocator, pbuf);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        prc = rp_spdk_execute(work, n_work, pbuf, spdk_sess,
+                              options->verify_crc ? 0 : 1);
+        rp_spdk_session_destroy(spdk_sess);
+    } else {
+        prc = rp_execute(work, n_work, pbuf, &pcfg);
+    }
+#else
+    prc = rp_execute(work, n_work, pbuf, &pcfg);
+#endif
     double elapsed = jbof_now_sec() - t0;
     free(work);
 
