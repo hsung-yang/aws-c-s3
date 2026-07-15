@@ -853,18 +853,27 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
                          "%.*s", (int)st->hostaddr.len, st->hostaddr.ptr);
             }
         }
-        rp_spdk_session_t *spdk_sess = rp_spdk_session_create(spdk_tgts,
-            (int)options->spdk_target_count, 1);
+        static rp_spdk_session_t *s_cached_sess = NULL;
+        static int s_cached_n_targets = 0;
+
+        if (!s_cached_sess || s_cached_n_targets != (int)options->spdk_target_count) {
+            if (s_cached_sess) {
+                rp_spdk_session_destroy(s_cached_sess);
+                s_cached_sess = NULL;
+            }
+            s_cached_sess = rp_spdk_session_create(spdk_tgts,
+                (int)options->spdk_target_count, 1);
+            s_cached_n_targets = (int)options->spdk_target_count;
+        }
         free(spdk_tgts);
-        if (!spdk_sess) {
+        if (!s_cached_sess) {
             free(work);
             if (bounce) free(bounce);
             aws_mem_release(allocator, pbuf);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
-        prc = rp_spdk_execute(work, n_work, pbuf, spdk_sess,
+        prc = rp_spdk_execute(work, n_work, pbuf, s_cached_sess,
                               options->verify_crc ? 0 : 1);
-        rp_spdk_session_destroy(spdk_sess);
     } else {
         prc = rp_execute(work, n_work, pbuf, &pcfg);
     }
@@ -1638,7 +1647,58 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     };
 
     double t0 = jbof_now_sec();
-    int prc = rp_execute(work, n_work, &pbuf, &pcfg);
+    int prc;
+#ifdef WITH_SPDK_BYPASS
+    if (options->spdk_targets && options->spdk_target_count > 0) {
+        rp_spdk_target_t *spdk_tgts = calloc(options->spdk_target_count,
+                                              sizeof(*spdk_tgts));
+        if (!spdk_tgts) {
+            free(work);
+            if (bounce) free(bounce);
+            pthread_mutex_destroy(&pool_ctx.counter_mu);
+            aws_mem_release(alloc, counters);
+            return aws_raise_error(AWS_ERROR_OOM);
+        }
+        for (size_t i = 0; i < options->spdk_target_count; i++) {
+            const struct aws_s3_jbof_spdk_target *st = &options->spdk_targets[i];
+            snprintf(spdk_tgts[i].traddr, sizeof(spdk_tgts[i].traddr), "%.*s",
+                     (int)st->traddr.len, st->traddr.ptr);
+            spdk_tgts[i].trsvcid = st->trsvcid;
+            snprintf(spdk_tgts[i].subnqn, sizeof(spdk_tgts[i].subnqn), "%.*s",
+                     (int)st->subnqn.len, st->subnqn.ptr);
+            if (st->hostaddr.len > 0) {
+                snprintf(spdk_tgts[i].hostaddr, sizeof(spdk_tgts[i].hostaddr),
+                         "%.*s", (int)st->hostaddr.len, st->hostaddr.ptr);
+            }
+        }
+        static rp_spdk_session_t *s_cached_sess = NULL;
+        static int s_cached_n_targets = 0;
+
+        if (!s_cached_sess || s_cached_n_targets != (int)options->spdk_target_count) {
+            if (s_cached_sess) {
+                rp_spdk_session_destroy(s_cached_sess);
+                s_cached_sess = NULL;
+            }
+            s_cached_sess = rp_spdk_session_create(spdk_tgts,
+                (int)options->spdk_target_count, 1);
+            s_cached_n_targets = (int)options->spdk_target_count;
+        }
+        free(spdk_tgts);
+        if (!s_cached_sess) {
+            free(work);
+            if (bounce) free(bounce);
+            pthread_mutex_destroy(&pool_ctx.counter_mu);
+            aws_mem_release(alloc, counters);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        prc = rp_spdk_execute(work, n_work, &pbuf, s_cached_sess,
+                              options->verify_crc ? 0 : 1);
+    } else {
+        prc = rp_execute(work, n_work, &pbuf, &pcfg);
+    }
+#else
+    prc = rp_execute(work, n_work, &pbuf, &pcfg);
+#endif
     double elapsed = jbof_now_sec() - t0;
     free(work);
     pthread_mutex_destroy(&pool_ctx.counter_mu);
