@@ -98,6 +98,14 @@ struct aws_s3_jbof_get_options {
      * matching the saturation harness "N procs per ns" pattern. */
     int                                     workers_per_target;
 
+    /* Maximum bytes per pread. 0 = no splitting (one pread per extent).
+     * Non-zero splits extents larger than this into multiple sub-I/Os,
+     * increasing NVMe-oF pipeline depth. Per-I/O CRC is skipped for
+     * sub-I/Os; end-to-end integrity is verified by the full-object CRC.
+     * Typical value: 131072 (128 KiB) — matches the 2026-07-10 saturation
+     * baseline. */
+    size_t                                  io_size;
+
     /* When 0, the planner skips CRC verification entirely (returns
      * crc_ok = 1 unconditionally). Used by saturation measurements
      * where the on-disk data is pre-existing and the bytes-per-second

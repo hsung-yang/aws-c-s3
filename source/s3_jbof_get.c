@@ -783,6 +783,7 @@ int aws_s3_jbof_get_object(struct aws_allocator *allocator,
     int rc = rp_plan_build_ranged(rex, (int)n_extents, plan_dst,
                                   options->req_range_offset,
                                   options->req_range_length,
+                                  options->io_size,
                                   &work, &n_work);
     aws_mem_release(allocator, rex);
     if (rc != RP_OK) {
@@ -1663,6 +1664,7 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
                                   plan_dst,
                                   options->req_range_offset,
                                   options->req_range_length,
+                                  options->io_size,
                                   &work, &n_work);
     aws_mem_release(alloc, local_extents);
     if (rc != RP_OK) {
