@@ -1035,11 +1035,13 @@ struct aws_s3_jbof_client {
     size_t                   cache_count;
     pthread_mutex_t          fd_mu;
     struct jbof_fd_entry    *fd_head;
-    /* SigV4 credentials. All zero-length → unsigned mode. */
     char access_key[256], secret_key[256], session_token[1024];
     char region[64], service[32];
     int  signing_enabled;
     int  use_o_direct;
+#ifdef WITH_SPDK_BYPASS
+    rp_spdk_session_t       *spdk_session;
+#endif
 };
 
 struct aws_s3_jbof_client *aws_s3_jbof_client_new(
@@ -1072,6 +1074,38 @@ struct aws_s3_jbof_client *aws_s3_jbof_client_new(
         if (!c->service[0]) snprintf(c->service, sizeof(c->service), "s3");
         c->signing_enabled = 1;
     }
+
+#ifdef WITH_SPDK_BYPASS
+    if (options->spdk_targets && options->spdk_target_count > 0) {
+        rp_spdk_target_t *spdk_tgts = calloc(options->spdk_target_count,
+                                              sizeof(*spdk_tgts));
+        if (!spdk_tgts) {
+            aws_mem_release(allocator, c);
+            aws_raise_error(AWS_ERROR_OOM);
+            return NULL;
+        }
+        for (size_t i = 0; i < options->spdk_target_count; i++) {
+            const struct aws_s3_jbof_spdk_target *st = &options->spdk_targets[i];
+            snprintf(spdk_tgts[i].traddr, sizeof(spdk_tgts[i].traddr), "%.*s",
+                     (int)st->traddr.len, st->traddr.ptr);
+            spdk_tgts[i].trsvcid = st->trsvcid;
+            snprintf(spdk_tgts[i].subnqn, sizeof(spdk_tgts[i].subnqn), "%.*s",
+                     (int)st->subnqn.len, st->subnqn.ptr);
+            if (st->hostaddr.len > 0) {
+                snprintf(spdk_tgts[i].hostaddr, sizeof(spdk_tgts[i].hostaddr),
+                         "%.*s", (int)st->hostaddr.len, st->hostaddr.ptr);
+            }
+        }
+        c->spdk_session = rp_spdk_session_create(spdk_tgts,
+            (int)options->spdk_target_count, 1);
+        free(spdk_tgts);
+        if (!c->spdk_session) {
+            aws_mem_release(allocator, c);
+            aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            return NULL;
+        }
+    }
+#endif
     return c;
 }
 
@@ -1098,7 +1132,22 @@ void aws_s3_jbof_client_destroy(struct aws_s3_jbof_client *c) {
     pthread_mutex_unlock(&c->fd_mu);
     pthread_mutex_destroy(&c->fd_mu);
 
+#ifdef WITH_SPDK_BYPASS
+    if (c->spdk_session) {
+        rp_spdk_session_destroy(c->spdk_session);
+        c->spdk_session = NULL;
+    }
+#endif
+
     aws_mem_release(c->alloc, c);
+}
+
+void *aws_s3_jbof_client_get_spdk_session(struct aws_s3_jbof_client *client) {
+#ifdef WITH_SPDK_BYPASS
+    return client ? client->spdk_session : NULL;
+#else
+    return NULL;
+#endif
 }
 
 /* Linear cache lookup. n is bounded by max_cache_entries (default 1024). */
@@ -1649,49 +1698,8 @@ int aws_s3_jbof_client_get_object(struct aws_s3_jbof_client *client,
     double t0 = jbof_now_sec();
     int prc;
 #ifdef WITH_SPDK_BYPASS
-    if (options->spdk_targets && options->spdk_target_count > 0) {
-        rp_spdk_target_t *spdk_tgts = calloc(options->spdk_target_count,
-                                              sizeof(*spdk_tgts));
-        if (!spdk_tgts) {
-            free(work);
-            if (bounce) free(bounce);
-            pthread_mutex_destroy(&pool_ctx.counter_mu);
-            aws_mem_release(alloc, counters);
-            return aws_raise_error(AWS_ERROR_OOM);
-        }
-        for (size_t i = 0; i < options->spdk_target_count; i++) {
-            const struct aws_s3_jbof_spdk_target *st = &options->spdk_targets[i];
-            snprintf(spdk_tgts[i].traddr, sizeof(spdk_tgts[i].traddr), "%.*s",
-                     (int)st->traddr.len, st->traddr.ptr);
-            spdk_tgts[i].trsvcid = st->trsvcid;
-            snprintf(spdk_tgts[i].subnqn, sizeof(spdk_tgts[i].subnqn), "%.*s",
-                     (int)st->subnqn.len, st->subnqn.ptr);
-            if (st->hostaddr.len > 0) {
-                snprintf(spdk_tgts[i].hostaddr, sizeof(spdk_tgts[i].hostaddr),
-                         "%.*s", (int)st->hostaddr.len, st->hostaddr.ptr);
-            }
-        }
-        static rp_spdk_session_t *s_cached_sess = NULL;
-        static int s_cached_n_targets = 0;
-
-        if (!s_cached_sess || s_cached_n_targets != (int)options->spdk_target_count) {
-            if (s_cached_sess) {
-                rp_spdk_session_destroy(s_cached_sess);
-                s_cached_sess = NULL;
-            }
-            s_cached_sess = rp_spdk_session_create(spdk_tgts,
-                (int)options->spdk_target_count, 1);
-            s_cached_n_targets = (int)options->spdk_target_count;
-        }
-        free(spdk_tgts);
-        if (!s_cached_sess) {
-            free(work);
-            if (bounce) free(bounce);
-            pthread_mutex_destroy(&pool_ctx.counter_mu);
-            aws_mem_release(alloc, counters);
-            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
-        }
-        prc = rp_spdk_execute(work, n_work, &pbuf, s_cached_sess,
+    if (client->spdk_session) {
+        prc = rp_spdk_execute(work, n_work, &pbuf, client->spdk_session,
                               options->verify_crc ? 0 : 1);
     } else {
         prc = rp_execute(work, n_work, &pbuf, &pcfg);

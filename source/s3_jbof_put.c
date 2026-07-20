@@ -24,6 +24,9 @@
 
 #include "object_rdma/read_planner.h"
 #include "object_rdma/write_planner.h"
+#ifdef WITH_SPDK_BYPASS
+#include "object_rdma/spdk_bypass.h"
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -38,9 +41,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define JBOF_PUT_MAX_EXTENTS    1024
+#define JBOF_PUT_MAX_EXTENTS    8192
 #define JBOF_PUT_HDR_BUF        65536
-#define JBOF_PUT_BODY_BUF       131072
+#define JBOF_PUT_BODY_BUF       1048576
 /* URI-encoding scratch sizes: S3 keys are capped at 1024 raw bytes, but
  * percent-encoding can triple that in the worst case (every byte -> "%XX");
  * bucket names are capped at 63 raw bytes. Generous vs. both limits. */
@@ -79,24 +82,25 @@ static int jbof_put_send_all(int fd, const char *buf, size_t len) {
     return 0;
 }
 
-static int jbof_put_recv_headers(int fd, char *buf, int bufsz) {
+static int jbof_put_recv_headers(int fd, char *buf, int bufsz, int *body_preread) {
+    *body_preread = 0;
     int total = 0;
     while (total < bufsz - 1) {
-        ssize_t n = recv(fd, buf + total, 1, 0);
-        if (n <= 0) break;
-        total++;
-        if (total >= 4 && memcmp(buf + total - 4, "\r\n\r\n", 4) == 0) break;
-    }
-    buf[total] = '\0';
-    return total;
-}
-
-static int jbof_put_recv_body(int fd, char *buf, int content_len) {
-    int total = 0;
-    while (total < content_len) {
-        ssize_t n = recv(fd, buf + total, content_len - total, 0);
+        ssize_t n = recv(fd, buf + total, bufsz - 1 - total, 0);
         if (n <= 0) break;
         total += (int)n;
+        int scan_from = total - (int)n - 3;
+        if (scan_from < 0) scan_from = 0;
+        for (int i = scan_from; i <= total - 4; i++) {
+            if (memcmp(buf + i, "\r\n\r\n", 4) == 0) {
+                int hdr_end = i + 4;
+                *body_preread = total - hdr_end;
+                /* Caller must null-terminate at buf[hdr_end] if needed;
+                 * we don't do it here to avoid clobbering pre-read body
+                 * bytes that start at buf[hdr_end]. */
+                return hdr_end;
+            }
+        }
     }
     buf[total] = '\0';
     return total;
@@ -244,6 +248,20 @@ static uint32_t jbof_put_crc32c_cpu(const void *buf, size_t len) {
     return crc ^ 0xFFFFFFFFu;
 }
 
+struct jbof_put_crc_args {
+    const void *src;
+    size_t      len;
+    uint32_t    crc;
+    int         rc;
+};
+
+static void *jbof_put_crc_thread_fn(void *arg) {
+    struct jbof_put_crc_args *a = (struct jbof_put_crc_args *)arg;
+    extern int jbof_put_full_crc_cuda(const void *src, size_t len, uint32_t *out_crc);
+    a->rc = jbof_put_full_crc_cuda(a->src, a->len, &a->crc);
+    return NULL;
+}
+
 /* ── target-device → fd resolver (open RDWR for PUT) ───────────────── */
 
 struct jbof_put_target_map {
@@ -309,6 +327,55 @@ static int jbof_put_parse_placement_extent(struct aws_json_value *eo,
     return out->length > 0 ? AWS_OP_SUCCESS : AWS_OP_ERR;
 }
 
+static int jbof_put_parse_to_write_work(struct aws_json_value *eo,
+                                        rp_spdk_write_work_t *out,
+                                        uint64_t *out_object_offset) {
+    memset(out, 0, sizeof(*out));
+    struct aws_json_value *v;
+    struct aws_byte_cursor s;
+    double d;
+
+    uint64_t object_offset = 0;
+    uint64_t start_lba = 0;
+    uint32_t lba_size = 0;
+    uint32_t data_offset_in_first_lba = 0;
+
+    v = aws_json_value_get_from_object(eo, aws_byte_cursor_from_c_str("object_offset"));
+    if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) object_offset = (uint64_t)d;
+
+    v = aws_json_value_get_from_object(eo, aws_byte_cursor_from_c_str("length"));
+    if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) out->valid_bytes = (uint64_t)d;
+
+    v = aws_json_value_get_from_object(eo, aws_byte_cursor_from_c_str("nsid"));
+    if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) out->target.nsid = (uint32_t)d;
+
+    v = aws_json_value_get_from_object(eo, aws_byte_cursor_from_c_str("start_lba"));
+    if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) start_lba = (uint64_t)d;
+
+    v = aws_json_value_get_from_object(eo, aws_byte_cursor_from_c_str("lba_size"));
+    if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) lba_size = (uint32_t)d;
+    if (lba_size == 0) lba_size = 4096;
+    out->lba_size = lba_size;
+
+    v = aws_json_value_get_from_object(eo, aws_byte_cursor_from_c_str("data_offset_in_first_lba"));
+    if (v && aws_json_value_get_number(v, &d) == AWS_OP_SUCCESS) data_offset_in_first_lba = (uint32_t)d;
+
+    out->byte_offset = start_lba * lba_size + data_offset_in_first_lba;
+    *out_object_offset = object_offset;
+
+    struct aws_json_value *tg = aws_json_value_get_from_object(eo,
+        aws_byte_cursor_from_c_str("target"));
+    if (tg) {
+        v = aws_json_value_get_from_object(tg, aws_byte_cursor_from_c_str("subnqn"));
+        if (v && aws_json_value_get_string(v, &s) == AWS_OP_SUCCESS) {
+            size_t n = s.len < sizeof(out->target.subnqn) - 1 ? s.len : sizeof(out->target.subnqn) - 1;
+            memcpy(out->target.subnqn, s.ptr, n);
+            out->target.subnqn[n] = '\0';
+        }
+    }
+    return out->valid_bytes > 0 ? AWS_OP_SUCCESS : AWS_OP_ERR;
+}
+
 /* ── Public entry: placement → write → commit ──────────────────────── */
 
 int aws_s3_jbof_put_object(struct aws_allocator *allocator,
@@ -331,11 +398,33 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     memcpy(host_z, options->meta_server_host.ptr, hlen);
     host_z[hlen] = '\0';
 
+    /* Pre-initialize CUDA context + persistent resources in the main
+     * thread so the CRC thread doesn't trigger lazy CUDA context init
+     * during phase 1 (which adds ~15-30ms of contention). */
+    extern void jbof_put_crc_cuda_init(void);
+    jbof_put_crc_cuda_init();
+
+    /* Launch CRC computation before phase 1 — the CRC only needs
+     * source_buffer+source_length, which are available now. This gives
+     * the GPU CRC a ~7 ms head start (phase 1 placement round-trip)
+     * before the SPDK write even begins. */
+    struct jbof_put_crc_args crc_args = {
+        .src = options->source_buffer,
+        .len = options->source_length,
+        .crc = 0,
+        .rc  = -1,
+    };
+    pthread_t crc_thread;
+    int crc_launched = 0;
+    if (pthread_create(&crc_thread, NULL, jbof_put_crc_thread_fn, &crc_args) == 0) {
+        crc_launched = 1;
+    }
+
     double t0 = jbof_put_now_sec();
 
     /* ── Phase 1: placement request ────────────────────────────────── */
     int sock = jbof_put_tcp_connect(host_z, options->meta_server_port);
-    if (sock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
+    if (sock < 0) { if (crc_launched) pthread_join(crc_thread, NULL); return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED); }
 
     /* Build the request path with the bucket/key percent-encoded (a raw
      * '?' or space in a key used to truncate/corrupt the request line --
@@ -354,6 +443,7 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
             options->bucket.ptr, options->bucket.len, bucket_enc, sizeof(bucket_enc));
         if (bucket_needed >= sizeof(bucket_enc)) {
             close(sock);
+            if (crc_launched) pthread_join(crc_thread, NULL);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
 
@@ -366,6 +456,7 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
             options->key.ptr, key_path_len, key_enc, sizeof(key_enc));
         if (key_needed >= sizeof(key_enc)) {
             close(sock);
+            if (crc_launched) pthread_join(crc_thread, NULL);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
 
@@ -374,6 +465,7 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
             (int)(options->key.len - key_path_len), options->key.ptr + key_path_len);
         if (pathlen < 0 || (size_t)pathlen >= sizeof(path)) {
             close(sock);
+            if (crc_launched) pthread_join(crc_thread, NULL);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
     }
@@ -386,8 +478,9 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
 
     char req[JBOF_PUT_PATH_BUF + 1536 + 512];
     int reqlen = snprintf(req, sizeof(req),
-        "PUT %s HTTP/1.0\r\n"
+        "PUT %s HTTP/1.1\r\n"
         "Host: %s:%u\r\n"
+        "Connection: keep-alive\r\n"
         "Accept: application/vnd.s3rdma.placement+json\r\n"
         "X-S3RDMA-Object-Size: %zu\r\n"
         "Content-Length: 0\r\n"
@@ -404,32 +497,62 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
          * bytes starting at req -- past the end of the stack buffer. Reject
          * instead of sending garbage/OOB memory over the wire. */
         close(sock);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
     if (jbof_put_send_all(sock, req, (size_t)reqlen) < 0) {
         close(sock);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
     }
 
     char hdr_buf[JBOF_PUT_HDR_BUF];
-    int hdrlen = jbof_put_recv_headers(sock, hdr_buf, sizeof(hdr_buf));
+    int body_preread = 0;
+    int hdrlen = jbof_put_recv_headers(sock, hdr_buf, sizeof(hdr_buf), &body_preread);
+    char saved_body_byte = hdr_buf[hdrlen];
+    hdr_buf[hdrlen] = '\0';
     /* Accept 200 or 202 for placement. */
     if (hdrlen < 12 || (!strstr(hdr_buf, " 200 ") && !strstr(hdr_buf, " 202 "))) {
         close(sock);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
     const char *cl = strstr(hdr_buf, "Content-Length:");
     int content_len = cl ? atoi(cl + 15) : 0;
     if (content_len <= 0 || content_len >= JBOF_PUT_BODY_BUF - 1) {
         close(sock);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
-    char *body = aws_mem_calloc(allocator, 1, (size_t)content_len + 1);
-    if (!body) { close(sock); return aws_raise_error(AWS_ERROR_OOM); }
-    int body_len = jbof_put_recv_body(sock, body, content_len);
-    close(sock);
+    char *body;
+    int body_on_heap = 0;
+#ifdef WITH_SPDK_BYPASS
+    if (options->spdk_session) {
+        body = rp_spdk_get_body_buf((rp_spdk_session_t *)options->spdk_session);
+    } else
+#endif
+    {
+        body = aws_mem_calloc(allocator, 1, (size_t)content_len + 1);
+        body_on_heap = 1;
+    }
+    if (!body) { close(sock); if (crc_launched) pthread_join(crc_thread, NULL); return aws_raise_error(AWS_ERROR_OOM); }
+    int body_len = 0;
+    if (body_preread > 0) {
+        hdr_buf[hdrlen] = saved_body_byte;
+        int copy = body_preread < content_len ? body_preread : content_len;
+        memcpy(body, hdr_buf + hdrlen, (size_t)copy);
+        body_len = copy;
+    }
+    while (body_len < content_len) {
+        ssize_t n = recv(sock, body + body_len, content_len - body_len, 0);
+        if (n <= 0) break;
+        body_len += (int)n;
+    }
+    /* Keep sock open for phase 3 commit (HTTP/1.1 keep-alive). */
     if (body_len < content_len) {
-        aws_mem_release(allocator, body);
+        close(sock);
+        if (body_on_heap) aws_mem_release(allocator, body);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
     }
 
@@ -437,55 +560,107 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     jbof_put_header_value(hdr_buf, "X-S3RDMA-Write-Token",
                           write_token, sizeof(write_token));
     if (!write_token[0]) {
-        aws_mem_release(allocator, body);
+        close(sock);
+        if (body_on_heap) aws_mem_release(allocator, body);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
 
     /* Parse placement extents. */
     struct aws_byte_cursor bc = aws_byte_cursor_from_array(body, (size_t)body_len);
     struct aws_json_value *root = aws_json_value_new_from_string(allocator, bc);
-    aws_mem_release(allocator, body);
-    if (!root) return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    if (body_on_heap) aws_mem_release(allocator, body);
+    if (!root) { close(sock); if (crc_launched) pthread_join(crc_thread, NULL); return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT); }
 
     struct aws_json_value *exts = aws_json_value_get_from_object(
         root, aws_byte_cursor_from_c_str("extents"));
     if (!exts || !aws_json_value_is_array(exts)) {
+        close(sock);
         aws_json_value_destroy(root);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
     size_t n_extents = aws_json_get_array_size(exts);
     if (n_extents == 0 || n_extents > JBOF_PUT_MAX_EXTENTS) {
+        close(sock);
         aws_json_value_destroy(root);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
+
+    const uint8_t *src_base = (const uint8_t *)options->source_buffer;
+    size_t total_bytes = 0;
+    double t_phase2 = 0;
+
+#ifdef WITH_SPDK_BYPASS
+    rp_spdk_write_work_t *sw = NULL;
+    if (options->spdk_session) {
+        sw = rp_spdk_get_write_work_buf(
+            (rp_spdk_session_t *)options->spdk_session);
+        if (!sw) {
+            close(sock);
+            aws_json_value_destroy(root);
+            if (crc_launched) pthread_join(crc_thread, NULL);
+            return aws_raise_error(AWS_ERROR_OOM);
+        }
+        for (size_t i = 0; i < n_extents; i++) {
+            struct aws_json_value *eo = aws_json_get_array_element(exts, i);
+            uint64_t obj_off = 0;
+            if (!eo || jbof_put_parse_to_write_work(eo, &sw[i], &obj_off) != AWS_OP_SUCCESS) {
+                close(sock);
+                aws_json_value_destroy(root);
+                if (crc_launched) pthread_join(crc_thread, NULL);
+                return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            }
+            if (obj_off > (uint64_t)options->source_length ||
+                sw[i].valid_bytes > (uint64_t)options->source_length - obj_off) {
+                close(sock);
+                aws_json_value_destroy(root);
+                if (crc_launched) pthread_join(crc_thread, NULL);
+                return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            }
+            sw[i].src = src_base + obj_off;
+            total_bytes += (size_t)sw[i].valid_bytes;
+        }
+        aws_json_value_destroy(root);
+        if (total_bytes != options->source_length) {
+            close(sock);
+            if (crc_launched) pthread_join(crc_thread, NULL);
+            return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+        }
+        t_phase2 = jbof_put_now_sec();
+        int sprc = rp_spdk_execute_write(sw, (int)n_extents,
+                                         (rp_spdk_session_t *)options->spdk_session);
+        if (sprc != RP_OK) {
+            close(sock);
+            if (crc_launched) pthread_join(crc_thread, NULL);
+            return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
+        }
+    } else
+#endif
+    {
     wp_extent_t *placement = aws_mem_calloc(allocator, n_extents, sizeof(wp_extent_t));
     if (!placement) {
+        close(sock);
         aws_json_value_destroy(root);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_OOM);
     }
-    size_t total_bytes = 0;
     for (size_t i = 0; i < n_extents; i++) {
         struct aws_json_value *eo = aws_json_get_array_element(exts, i);
         if (!eo || jbof_put_parse_placement_extent(eo, &placement[i]) != AWS_OP_SUCCESS) {
+            close(sock);
             aws_mem_release(allocator, placement);
             aws_json_value_destroy(root);
+            if (crc_launched) pthread_join(crc_thread, NULL);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
-        /* wp_plan_build() (write_planner.c) computes each work item's
-         * source pointer as source_base + extent.object_offset and reads
-         * extent.length bytes from there -- it has no visibility into
-         * options->source_length and trusts the server-supplied extent
-         * verbatim. A malicious or buggy metadata server can therefore
-         * hand back an object_offset (or object_offset+length) beyond the
-         * caller's source_buffer, causing wp_plan_build/pwrite to read
-         * past the end of source_buffer (info leak of adjacent memory
-         * onto disk, or a SIGSEGV). Validate here, before the pointer
-         * arithmetic ever happens. The order below (offset check first)
-         * avoids unsigned underflow in the subtraction. */
         if (placement[i].object_offset > (uint64_t)options->source_length ||
             placement[i].length > (uint64_t)options->source_length - placement[i].object_offset) {
+            close(sock);
             aws_mem_release(allocator, placement);
             aws_json_value_destroy(root);
+            if (crc_launched) pthread_join(crc_thread, NULL);
             return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         }
         total_bytes += (size_t)placement[i].length;
@@ -493,17 +668,24 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     aws_json_value_destroy(root);
 
     if (total_bytes != options->source_length) {
+        close(sock);
         aws_mem_release(allocator, placement);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
 
-    /* ── Phase 2: pwrite via write_planner ─────────────────────────── */
+    t_phase2 = jbof_put_now_sec();
+
     wp_write_work_t *work = NULL;
     int n_work = 0;
     int rc = wp_plan_build(placement, (int)n_extents, options->source_buffer,
                            &work, &n_work);
     aws_mem_release(allocator, placement);
-    if (rc != RP_OK) return aws_raise_error(AWS_ERROR_UNKNOWN);
+    if (rc != RP_OK) {
+        close(sock);
+        if (crc_launched) pthread_join(crc_thread, NULL);
+        return aws_raise_error(AWS_ERROR_UNKNOWN);
+    }
 
     struct jbof_put_target_map map = {
         .entries = options->target_devices,
@@ -513,61 +695,32 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
         .worker_threads   = options->workers_per_target,
         .open_target      = jbof_put_open_target,
         .open_target_user = &map,
-        /* skip_crc is irrelevant for write; we compute CRC inline if host
-         * build provides cpu_crc32c. CUDA build: helper computes a full-
-         * buffer CRC32C on commit; per-extent CRCs not needed yet. */
         .skip_crc         = 1,
     };
     wp_write_result_t wr = {0};
     int prc = wp_execute(work, n_work, &pcfg, &wr);
     free(work);
     if (prc != RP_OK) {
-        wp_write_result_clean_up(&wr);
-        /* TODO(remaining_for_complete_client.md): the metadata server has
-         * already reserved LBAs and handed us `write_token` in phase 1
-         * (above). On this failure path we bail out without telling the
-         * server the placement is dead, leaking those reserved extents
-         * server-side until some (currently nonexistent) GC/lease-expiry
-         * mechanism reclaims them. There is no release/abort endpoint for
-         * a single-part PUT's write_token in RDMA_PROTOCOL_SPEC.md today
-         * (aws_s3_jbof_mpu_abort() in s3_jbof_mpu.c is a different,
-         * MPU-only protocol and endpoint -- not reusable here). Client-side
-         * memory is correctly freed either way; do not invent a new server
-         * endpoint from the client side. */
-        return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
-    }
-
-    /* Full-object CRC32C for the commit phase. Try GPU (nvcomp) first;
-     * jbof_put_full_crc_cuda() reports success/failure via an explicit
-     * out-param + return code (see s3_jbof_put_crc_cuda.c) instead of the
-     * old "0 means failure" sentinel, which was wrong: a real CRC32C can
-     * legitimately be 0.
-     *
-     * Return code contract:
-     *   0  -> success, full_crc is valid.
-     *  -1  -> source_buffer is confirmed plain host memory (not
-     *         GPU-reachable). Safe, expected fallback case: CPU-CRC it.
-     *  -2  -> a genuine CUDA/nvcomp call failed while operating on memory
-     *         already confirmed GPU-reachable (device/managed/pinned).
-     *         In this case source_buffer may be device-only memory that
-     *         the CPU cannot dereference at all -- the old code ran the
-     *         same per-byte CPU loop unconditionally on ANY failure,
-     *         which is a guaranteed SIGSEGV / undefined behavior against
-     *         device-only memory. There is no reliable "is host
-     *         reachable" flag on aws_s3_jbof_put_options to disambiguate
-     *         further (adding one is out of scope for this fix), so the
-     *         only safe action here is to fail the PUT instead of
-     *         gambling on a host dereference of unknown memory. */
-    extern int jbof_put_full_crc_cuda(const void *src, size_t len, uint32_t *out_crc);
-    uint32_t full_crc = 0;
-    int crc_rc = jbof_put_full_crc_cuda(options->source_buffer, options->source_length, &full_crc);
-    if (crc_rc == -1) {
-        full_crc = jbof_put_crc32c_cpu(options->source_buffer, options->source_length);
-    } else if (crc_rc != 0) {
+        close(sock);
+        if (crc_launched) pthread_join(crc_thread, NULL);
         wp_write_result_clean_up(&wr);
         return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
     }
     wp_write_result_clean_up(&wr);
+    }
+
+    if (crc_launched) pthread_join(crc_thread, NULL);
+    uint32_t full_crc = crc_args.crc;
+    if (crc_args.rc == -1) {
+        full_crc = jbof_put_crc32c_cpu(options->source_buffer, options->source_length);
+    } else if (crc_args.rc != 0) {
+        close(sock);
+        return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
+    }
+
+    fprintf(stderr, "[put] phase1(placement): %.1f ms, phase2(pwrite): %.1f ms\n",
+            (t_phase2 - t0) * 1000.0,
+            (jbof_put_now_sec() - t_phase2) * 1000.0);
 
     /* S3 spec requires x-amz-checksum-crc32c to be the base64 encoding of
      * the 4-byte big-endian CRC32C, not a decimal integer -- the previous
@@ -581,12 +734,12 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     uint8_t crc_b64_bytes[16];
     struct aws_byte_buf crc_b64_buf = aws_byte_buf_from_empty_array(crc_b64_bytes, sizeof(crc_b64_bytes));
     if (aws_base64_encode(&crc_cursor, &crc_b64_buf) != AWS_OP_SUCCESS) {
+        close(sock);
         return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
     }
 
-    /* ── Phase 3: commit ──────────────────────────────────────────── */
-    int csock = jbof_put_tcp_connect(host_z, options->meta_server_port);
-    if (csock < 0) return aws_raise_error(AWS_IO_SOCKET_NOT_CONNECTED);
+    /* ── Phase 3: commit (reuses phase 1 socket via HTTP/1.1 keep-alive) ── */
+    double t_phase3 = jbof_put_now_sec();
 
     /* options->key may already carry a query string (MPU part uploads:
      * "<key>?partNumber=N&uploadId=X"). Appending "?rdma-commit" in that
@@ -608,8 +761,9 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
 
     char creq[JBOF_PUT_PATH_BUF + 1536 + 512];
     int crlen = snprintf(creq, sizeof(creq),
-        "PUT %s%s HTTP/1.0\r\n"
+        "PUT %s%s HTTP/1.1\r\n"
         "Host: %s:%u\r\n"
+        "Connection: close\r\n"
         "X-S3RDMA-Write-Token: %s\r\n"
         "x-amz-checksum-crc32c: %.*s\r\n"
         "Content-Length: 0\r\n"
@@ -626,16 +780,18 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
          * snprintf()'s return value ignores truncation, so without this
          * check an oversized bucket/key/csig would make crlen exceed
          * sizeof(creq) and the send below would read past the buffer. */
-        close(csock);
+        close(sock);
         return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
     }
-    if (jbof_put_send_all(csock, creq, (size_t)crlen) < 0) {
-        close(csock);
+    if (jbof_put_send_all(sock, creq, (size_t)crlen) < 0) {
+        close(sock);
         return aws_raise_error(AWS_ERROR_HTTP_CONNECTION_CLOSED);
     }
     char chdr[JBOF_PUT_HDR_BUF];
-    int chlen = jbof_put_recv_headers(csock, chdr, sizeof(chdr));
-    close(csock);
+    int chdr_preread = 0;
+    int chlen = jbof_put_recv_headers(sock, chdr, sizeof(chdr), &chdr_preread);
+    close(sock);
+    chdr[chlen] = '\0';
     if (chlen < 12 || !strstr(chdr, " 200 ")) {
         return aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
     }
@@ -648,6 +804,9 @@ int aws_s3_jbof_put_object(struct aws_allocator *allocator,
     }
     out_result->bytes_written       = options->source_length;
     out_result->elapsed_seconds     = jbof_put_now_sec() - t0;
+    fprintf(stderr, "[put] phase3(commit): %.1f ms, total: %.1f ms\n",
+            (jbof_put_now_sec() - t_phase3) * 1000.0,
+            out_result->elapsed_seconds * 1000.0);
     out_result->full_object_crc32c  = full_crc;
     return AWS_OP_SUCCESS;
 }

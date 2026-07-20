@@ -65,6 +65,13 @@ struct aws_s3_jbof_client_options {
 
     /* When non-zero, pool fds opened with O_DIRECT (page cache bypass). */
     int                    use_o_direct;
+
+    /* SPDK bypass targets. When non-NULL, the client initializes the SPDK
+     * environment and creates a session at client_new time, so the first
+     * GET does not pay env_init + connect + qpair + bounce costs.
+     * Requires -DWITH_SPDK_BYPASS=ON at build time; ignored otherwise. */
+    const struct aws_s3_jbof_spdk_target *spdk_targets;
+    size_t                                  spdk_target_count;
 };
 
 struct aws_s3_jbof_get_options {
@@ -190,6 +197,13 @@ struct aws_s3_jbof_client *aws_s3_jbof_client_new(
 
 AWS_S3_API
 void aws_s3_jbof_client_destroy(struct aws_s3_jbof_client *client);
+
+/* Returns the client's SPDK bypass session, or NULL if SPDK is not
+ * configured.  The returned pointer is valid until client_destroy.
+ * Pass it to aws_s3_jbof_put_options.spdk_session to enable SPDK
+ * write bypass for PUT. */
+AWS_S3_API
+void *aws_s3_jbof_client_get_spdk_session(struct aws_s3_jbof_client *client);
 
 /* Same as aws_s3_jbof_get_object but routes through the client's layout
  * cache and fd pool: a cache hit skips the HTTP round-trip; fds are

@@ -42,6 +42,11 @@ struct aws_s3_jbof_put_options {
 
     int                                     workers_per_target;
 
+    /* SPDK session for write bypass. If non-NULL, phase 2 uses SPDK
+     * userspace NVMe-oF (spdk_nvme_ns_cmd_write) instead of kernel
+     * pwrite(). Obtain via aws_s3_jbof_client_get_spdk_session(). */
+    void                                   *spdk_session;
+
     /* SigV4. All-empty → unsigned. */
     struct aws_byte_cursor access_key;
     struct aws_byte_cursor secret_key;
