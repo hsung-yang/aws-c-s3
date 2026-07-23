@@ -327,6 +327,7 @@ static int jbof_put_parse_placement_extent(struct aws_json_value *eo,
     return out->length > 0 ? AWS_OP_SUCCESS : AWS_OP_ERR;
 }
 
+#ifdef WITH_SPDK_BYPASS
 static int jbof_put_parse_to_write_work(struct aws_json_value *eo,
                                         rp_spdk_write_work_t *out,
                                         uint64_t *out_object_offset) {
@@ -375,6 +376,7 @@ static int jbof_put_parse_to_write_work(struct aws_json_value *eo,
     }
     return out->valid_bytes > 0 ? AWS_OP_SUCCESS : AWS_OP_ERR;
 }
+#endif /* WITH_SPDK_BYPASS */
 
 /* ── Public entry: placement → write → commit ──────────────────────── */
 
